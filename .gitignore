@@ -1,5 +1,8 @@
 **/*.parquet
 **/*.bin
+**/*.zst
 **/downloaded
 **/*_token
+weight/
 .idea/
+**/__pycache__/**
