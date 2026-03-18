@@ -15,7 +15,7 @@ from torch.nn.functional import cross_entropy
 from tqdm import tqdm
 
 from transformer.transformer import Transformer
-from dataset import ZstdTokenStreamDataset
+from dataset import MixedTokenStreamDataset
 
 
 def set_seed(seed: int):
@@ -28,12 +28,15 @@ def set_seed(seed: int):
 
 save_dir = "weight"
 
+global_no_save = False
 
 def save_checkpoint(meta, model, optimizer=None, scheduler=None):
+    if global_no_save:
+        return
     os.makedirs(save_dir, exist_ok=True)
     timestamp = time.strftime("%m%d-%H%M")
     with open(f"weight/gpt-{timestamp}.json", "w") as f:
-        json.dump(meta, f)
+        json.dump(meta, f, indent=4)
     torch.save(model.state_dict(), f"weight/gpt-{timestamp}.pt")
     if optimizer is not None:
         torch.save(optimizer.state_dict(), f"weight/gpt-{timestamp}.opt.pt")
@@ -60,22 +63,15 @@ if __name__ == "__main__":
     vocab_size = tokenizer.get_vocab_size()
     print("Vocab size:", vocab_size)
 
-    training_set = glob.glob("data/*/chunk-*-tokenized.bin.zst")
-    random.shuffle(training_set)
-
-    training_set_start = 0
-    training_set_end = 17  # suggested: Params (M) / 3
-    training_set = training_set[training_set_start:training_set_end]
-    print(training_set)
-
     n_layers, d_model, n_heads, batch_size, max_lr, min_lr = preset("smallest")
+    seq_len = 512
 
     model = Transformer(
         n_layers=n_layers,
         d_model=d_model,
         n_heads=n_heads,
         vocab_size=vocab_size,
-        max_len=512
+        max_len=seq_len
     )
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Params: {total_params:,}")
@@ -83,19 +79,44 @@ if __name__ == "__main__":
     device = torch.device("cuda:0")
 
     # total ~ 80B tokens
-    est_tokens_per_file = 60000000
-    est_tokens = len(training_set) * est_tokens_per_file
-    est_total_steps = est_tokens // batch_size // model.max_len
-    print(f"Training tokens (est): {est_tokens:,}")
+    # est_tokens_per_file = 60000000
+    # est_tokens = len(training_set) * est_tokens_per_file
+    # est_total_steps = est_tokens // batch_size // model.max_len
+    # print(f"Training tokens (est): {est_tokens:,}")
 
-    warmup_steps = int(est_total_steps * 0.01)
-    cosine_steps = int(est_total_steps * 0.95)
+    # warmup_steps = int(est_total_steps * 0.01)
+    # cosine_steps = int(est_total_steps * 0.95)
+
+    training_token_coeff = 20.0
+    n_batches = int(total_params * training_token_coeff / batch_size / seq_len)
+    n_tokens = n_batches * batch_size * seq_len
+    print(f"Training tokens: {n_tokens:,}")
+
+    warmup_steps = int(n_batches * 0.01)
+    cosine_steps = int(n_batches * 0.95)
 
     loader = DataLoader(
-        dataset=ZstdTokenStreamDataset(
-            files=training_set,
-            seq_len=model.max_len,
-            parallel_files=16
+        dataset=MixedTokenStreamDataset(
+            path="data",
+            n_seq=n_batches * batch_size,
+            seq_len=seq_len,
+            dataset_weights={
+                # web
+                "c4": 40,
+                "fineweb" : 40,
+                "openwebtext2" : 20,
+
+                # academic
+                "arxiv" : 10,
+                "pubmed" : 20,
+
+                # literature
+                "book2": 20,
+
+                # wiki
+                "wikipedia" : 10
+            },
+            max_parallel=64
         ),
         batch_size=batch_size,
         shuffle=False,
@@ -104,19 +125,37 @@ if __name__ == "__main__":
         prefetch_factor=2,
         persistent_workers=True
     )
+
+    load_timestamp = None
+    # load_timestamp = "0317-2149"
+
+    if load_timestamp:
+        model.load_state_dict(torch.load(f"weight/gpt-{load_timestamp}.pt"))
+
+    model.to(device)
+
     optimizer = AdamW(model.parameters(), lr=max_lr)
+    if load_timestamp:
+        optimizer.load_state_dict(torch.load(f"weight/gpt-{load_timestamp}.opt.pt"))
+
     scheduler = SequentialLR(
         optimizer=optimizer,
         schedulers=[
-            LinearLR(optimizer, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps),
-            CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=min_lr),
-            ConstantLR(optimizer, factor=min_lr / max_lr)
+            LinearLR(optimizer, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps), #  1 %
+            CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=min_lr),                 # 95 %
+            ConstantLR(optimizer, factor=min_lr / max_lr, total_iters=n_batches * 999)        # rest
         ],
-        milestones=[warmup_steps, cosine_steps]
+        milestones=[warmup_steps, warmup_steps + cosine_steps]
     )
 
-    model.to(device)
+    if load_timestamp:
+        with open(f"weight/gpt-{load_timestamp}.json", "r") as f:
+            load_meta = json.load(f)
+    else:
+        load_meta = None
+
     model.train()
+    # model.eval()
 
     sum_loss = 0
     sum_tokens = 0
@@ -127,8 +166,14 @@ if __name__ == "__main__":
     ema_loss_denom = 0
     ema_loss_alpha = 0.1
 
-    pbar = tqdm(loader, total=est_total_steps, mininterval=0)
+
+
+    pbar = tqdm(loader, total=n_batches, mininterval=0)
     for batch in pbar:
+        if load_meta and pbar.n < load_meta["iteration"]:
+            scheduler.step()
+            continue
+
         batch = batch.to(device)
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
@@ -156,6 +201,7 @@ if __name__ == "__main__":
             sum_loss = 0
             lr = optimizer.param_groups[0]["lr"]
             print(f"Learning rate: {lr:.6f}, Perplexity: {ppl:.2f}")
+            # print(f"Learning rate: 0, Perplexity: {ppl:.2f}")
 
             ema_loss_numer = avg_loss * ema_loss_alpha + ema_loss_numer * (1 - ema_loss_alpha)
             ema_loss_denom = ema_loss_alpha + ema_loss_denom * (1 - ema_loss_alpha)
@@ -170,8 +216,7 @@ if __name__ == "__main__":
                     "batch_size": batch_size,
                     "max_lr": max_lr,
                     "min_lr": min_lr,
-                    "training_set_start": training_set_start,
-                    "training_set_end": training_set_end,
+                    "n_batches" : n_batches,
                     "finished": False,
                     "iteration": pbar.n,
                     "avg_perplexity": math.exp(ema_loss_numer / ema_loss_denom)
@@ -183,8 +228,14 @@ if __name__ == "__main__":
 
     save_checkpoint(
         meta={
-            "training_set_start": training_set_start,
-            "training_set_end": training_set_end,
+            "d_model": model.d_model,
+            "n_layers": model.n_layers,
+            "n_heads": model.n_heads,
+            "max_len": model.max_len,
+            "batch_size": batch_size,
+            "max_lr": max_lr,
+            "min_lr": min_lr,
+            "n_batches" : n_batches,
             "finished": True,
             "iteration": pbar.n,
             "avg_perplexity": math.exp(ema_loss_numer / ema_loss_denom)

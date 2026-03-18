@@ -1,22 +1,42 @@
 import os
 import glob
 import random
-
-import pyarrow.parquet as pq
+import warnings
+from typing import Optional, Generator
 import torch
 from torch.utils.data import IterableDataset, get_worker_info, DataLoader
 import zstandard as zstd
 import numpy as np
+from torch.utils.data._utils.worker import WorkerInfo
 from tqdm import tqdm
 
 
-class ZstdTokenStreamDataset(IterableDataset):
+class MixedTokenStreamDataset(IterableDataset):
 
-    def __init__(self, files, seq_len, parallel_files=1, reader_streaming_size=(1<<20)):
-        self.files = files
+    def __init__(
+            self,
+            path: str,
+            n_seq: int,
+            seq_len: int,
+            dataset_weights: dict[str, int],
+            max_parallel: Optional[int] = None,
+            rbuf_size: int = (1 << 20),
+            print_file_ops: bool = False,
+            seed: int = 42
+    ):
+        self.path = path
+        self.n_seq = n_seq
         self.seq_len = seq_len
-        self.parallel = parallel_files
-        self.reader_streaming_size = reader_streaming_size
+        self.dataset_weights = dataset_weights
+        if max_parallel is None:
+            self.max_parallel = len(dataset_weights)
+        else:
+            if max_parallel < len(dataset_weights):
+                raise ValueError("max_parallel must be >= number of datasets")
+            self.max_parallel = max_parallel
+        self.rbuf_size = rbuf_size
+        self.print_file_ops = print_file_ops
+        self.seed = seed
 
     def _file_iter(self, file):
         # sliding window length: seq_len + 1
@@ -25,13 +45,15 @@ class ZstdTokenStreamDataset(IterableDataset):
         seq_len = self.seq_len
         dctx = zstd.ZstdDecompressor()
         with open(file, "rb") as f:
+            if self.print_file_ops:
+                print(f"[Dataset] Reading {file}")
             with dctx.stream_reader(f) as reader:
 
                 bytes_buf = b''
                 tokens_buf = np.empty(0, dtype=np.uint16)
 
                 while True:
-                    chunk = reader.read(self.reader_streaming_size)
+                    chunk = reader.read(self.rbuf_size)
                     if not chunk:
                         break
 
@@ -60,41 +82,99 @@ class ZstdTokenStreamDataset(IterableDataset):
                     n = (arr.size - 1 - start_pos) // self.seq_len
                     for i in range(n):
                         yield torch.tensor(arr[
-                                start_pos + i * self.seq_len:
-                                start_pos + (i + 1) * self.seq_len + 1
-                            ], dtype=torch.long)
+                                               start_pos + i * self.seq_len:
+                                               start_pos + (i + 1) * self.seq_len + 1
+                                           ], dtype=torch.long)
 
                     tokens_buf = arr[start_pos + n * self.seq_len:]
+        if self.print_file_ops:
+            print(f"[Dataset] Completed {file}")
 
+    def _dataset_iter(self, dataset: str, n_parallel: int, worker_info=None):
+        files = glob.glob(os.path.join(self.path, dataset, "chunk-*-tokenized.bin.zst"))
+        if len(files) == 0:
+            raise FileNotFoundError(f"dataset {dataset} not found")
+        print(f"dataset: found {len(files)} chunks of dataset {dataset}")
 
-    def __iter__(self):
-        worker = get_worker_info()
-        if worker is None:
-            files = self.files
-        else:
-            files = self.files[worker.id:: worker.num_workers]
+        if worker_info is not None:
+            worker_offset = worker_info.id
+            if len(files) < worker_info.num_workers:
+                warnings.warn(
+                    f"{worker_info.num_workers} workers created on {len(files)} chunks of dataset {dataset}"
+                )
+                worker_offset %= worker_info.num_workers
+            files = files[worker_offset::worker_info.num_workers]
+        n_files = len(files)
 
-        file_idx = 0
-        n_parallel = min(self.parallel, len(files))
-        files_iter = [self._file_iter(file) for file in files[:n_parallel]]
-        file_idx += n_parallel
+        def shuffle_files(seed_offset):
+            g = torch.Generator()
+            g.manual_seed(self.seed ^ seed_offset)
+            perm = torch.randperm(n_files, generator=g).tolist()
+            return [files[i] for i in perm]
+
+        shuffle_seed = 0
+        shuffled_files = shuffle_files(shuffle_seed)
+
+        load_idx = 0
+        n_parallel = min(n_parallel, n_files)
+        file_iters: list[Optional[Generator]] = [None for _ in range(n_parallel)]
 
         i = 0
-        # round-robin
-        while files_iter:
-            if i >= len(files_iter):
+        # round-robin, endless
+        while True:
+            if i >= n_parallel:
                 i = 0
-            try:
-                yield next(files_iter[i])
-                i += 1
-            except StopIteration:
-                if file_idx < len(files):
-                    files_iter[i] = self._file_iter(files[file_idx])
-                    file_idx += 1
-                else:
-                    files_iter.pop(i)
+            if file_iters[i] is None:
+                file_iters[i] = self._file_iter(shuffled_files[load_idx])
+                try:
+                    yield next(file_iters[i])
+                    i += 1
+                except StopIteration:
+                    raise ValueError(f"invalid data chunk {shuffled_files[load_idx]}")
+                load_idx = load_idx + 1
+                if load_idx >= n_files:
+                    load_idx = 0
+                    shuffle_seed += 1
+                    shuffled_files = shuffle_files(shuffle_seed)
+            else:
+                try:
+                    yield next(file_iters[i])
+                    i += 1
+                except StopIteration:
+                    file_iters[i] = None
 
+    def __iter__(self):
+        worker_info: Optional[WorkerInfo] = get_worker_info()
 
+        dataset_weights = self.dataset_weights
+        for _, value in dataset_weights.items():
+            if value <= 0:
+                raise ValueError(f"invalid dataset weight: {value}")
+
+        # allocate n_parallel
+        x = self.max_parallel - len(dataset_weights)
+        total_weight = sum(dataset_weights.values())
+        alloc_parallel = {
+            key: 1 + x * weight // total_weight
+            for key, weight in dataset_weights.items()
+        }
+        remain_n_parallel = self.max_parallel - sum(alloc_parallel.values())
+        r = {
+            key: x * weight % total_weight
+            for key, weight in dataset_weights.items()
+        }
+        for key in sorted(dataset_weights.keys(), key=lambda k: r[k], reverse=True)[:remain_n_parallel]:
+            alloc_parallel[key] += 1
+
+        dataset_iters = {
+            key : self._dataset_iter(key, alloc_parallel[key], worker_info)
+            for key in dataset_weights.keys()
+        }
+        list_keys = list(dataset_weights.keys())
+        list_weights = list(dataset_weights.values())
+        for _ in range(self.n_seq):
+            dataset = random.choices(list_keys, list_weights)[0]
+            yield next(dataset_iters[dataset])
 
 
 if __name__ == "__main__":
@@ -109,11 +189,20 @@ if __name__ == "__main__":
 
     batch_size = 32
     max_len = 512
+    n_batches = 10000
 
-    print("steps (est): ", 60000000 * len(training_set) // batch_size // max_len)
+    # print("steps (est): ", 60000000 * len(training_set) // batch_size // max_len)
 
     loader = DataLoader(
-        dataset=ZstdTokenStreamDataset(files=training_set[:sample], seq_len=max_len, parallel_files=4),
+        dataset=MixedTokenStreamDataset(
+            path="data",
+            n_seq=n_batches * batch_size,
+            seq_len=max_len,
+            dataset_weights={
+                "arxiv": 1
+            },
+            max_parallel=4
+        ),
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
@@ -123,9 +212,9 @@ if __name__ == "__main__":
     )
 
     steps = 0
-    for batch in tqdm(loader):
+    for batch in tqdm(loader, total=n_batches):
         if steps == 0:
             print(batch.shape)
         steps += 1
 
-    print("steps (est from sample): ", steps * len(training_set) // sample)
+    # print("steps (est from sample): ", steps * len(training_set) // sample)
