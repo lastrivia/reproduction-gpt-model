@@ -28,8 +28,8 @@ class DecoderBlock(nn.Module):
         )
         self.dropout_2 = nn.Dropout(dropout)
 
-    def forward(self, x, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
-        x = x + self.dropout_1(self.attn(self.norm_1(x), rope_cache=rope_cache))
+    def forward(self, x):
+        x = x + self.dropout_1(self.attn(self.norm_1(x)))
         x = x + self.dropout_2(self.ffn(self.norm_2(x)))
         return x
 
@@ -42,21 +42,13 @@ class Transformer(nn.Module):
     ):
         super(Transformer, self).__init__()
         if d_model % (2 * n_heads) != 0:
-            raise ValueError('d_model must be divisible by (2 * n_heads)')
+            raise ValueError('d_model must be divisible by (2 * n_heads)') # d_rope == d_head // 2
         self.n_layers = n_layers
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.vocab_size = vocab_size
         self.max_len = max_len
-
-        # RoPE cache
-        d_rope = self.d_head // 2
-        angular_velocity = 1e-4 ** (torch.arange(d_rope) / d_rope)
-        pos = torch.arange(max_len)
-        angles = torch.outer(pos, angular_velocity)
-        self.register_buffer("rope_sin", torch.sin(angles), persistent=False)
-        self.register_buffer("rope_cos", torch.cos(angles), persistent=False)
 
         # Layers
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -70,7 +62,7 @@ class Transformer(nn.Module):
     def forward(self, x):
         x = self.embedding(x)
         for decoder in self.decoders:
-            x = decoder(x, rope_cache=(self.rope_sin, self.rope_cos))
+            x = decoder(x)
         x = self.final_ln(x)
         logits = x @ self.embedding.weight.T
         return logits

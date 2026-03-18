@@ -1,7 +1,8 @@
 import torch
 from torch import nn
 from torch.nn.functional import scaled_dot_product_attention
-from typing import Optional, Tuple
+
+from .rope import get_rope_cache, apply_rope
 
 
 class Attention(nn.Module):
@@ -16,18 +17,7 @@ class Attention(nn.Module):
         self.w_qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=True)
 
-    def _apply_rope(self, x, rope_cache, begin_pos=0):
-        # input: [batch_size, self.n_heads, ctx_len, self.d_head]
-        end_pos = begin_pos + x.shape[2]
-        rope_cache_sin, rope_cache_cos = rope_cache
-        rope_sin = (rope_cache_sin[begin_pos:end_pos, :])[None, None, :, :]
-        rope_cos = (rope_cache_cos[begin_pos:end_pos, :])[None, None, :, :]
-        x0, x1 = x.chunk(2, dim=-1)
-        x_rope = torch.cat([x0 * rope_cos - x1 * rope_sin,
-                            x1 * rope_cos + x0 * rope_sin], dim=-1)
-        return x_rope
-
-    def forward(self, x, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+    def forward(self, x):
         batch_size = x.shape[0]
         ctx_len = x.shape[1]
 
@@ -38,10 +28,15 @@ class Attention(nn.Module):
         v = qkv[:, :, 2, :].view(batch_size, ctx_len, self.n_heads, self.d_head).transpose(1, 2)
         # todo kv cache
 
-        # apply RoPE
-        if rope_cache is not None:
-            q = self._apply_rope(q, begin_pos=0, rope_cache=rope_cache)
-            k = self._apply_rope(k, begin_pos=0, rope_cache=rope_cache)
+        rope_cos, rope_sin = get_rope_cache(
+            d_rope=self.d_head // 2,
+            seq_len=ctx_len,
+            offset=0,
+            device=x.device,
+            dtype=x.dtype
+        )
+        q = apply_rope(q, rope_cos, rope_sin)
+        k = apply_rope(k, rope_cos, rope_sin)
 
         out = scaled_dot_product_attention(
             q, k, v, is_causal=True
