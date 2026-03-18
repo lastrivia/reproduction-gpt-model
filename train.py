@@ -1,6 +1,7 @@
 import math
 import time
 import os
+import warnings
 import numpy as np
 import glob
 import json
@@ -30,12 +31,19 @@ def set_seed(seed: int):
 
 save_dir = "weight"
 
-global_no_save = False
+global_no_save = True
 
 
-def save_checkpoint(meta, model, optimizer=None, scheduler=None, ppl_plot_x=None, ppl_plot_y=None, show_plt=False):
+def save_checkpoint(meta, model, optimizer=None, ppl_plot_x=None, ppl_plot_y=None, show_plt=False):
     if global_no_save:
+        if ppl_plot_x is not None and ppl_plot_y is not None:
+            plot_training_curve(
+                iteration=ppl_plot_x,
+                ppl=ppl_plot_y,
+                show=show_plt
+            )
         return
+
     os.makedirs(save_dir, exist_ok=True)
 
     timestamp = time.strftime("%m%d-%H%M")
@@ -44,8 +52,6 @@ def save_checkpoint(meta, model, optimizer=None, scheduler=None, ppl_plot_x=None
     torch.save(model.state_dict(), f"weight/gpt-{timestamp}.pt")
     if optimizer is not None:
         torch.save(optimizer.state_dict(), f"weight/gpt-{timestamp}.opt.pt")
-    # if scheduler is not None:
-    #     torch.save(scheduler.state_dict(), f"weight/gpt-{timestamp}.sch.pt")
     if ppl_plot_x is not None and ppl_plot_y is not None:
         plot_training_curve(
             iteration=ppl_plot_x,
@@ -134,17 +140,23 @@ if __name__ == "__main__":
         persistent_workers=True
     )
 
-    load_timestamp = None
-    # load_timestamp = "0317-2149"
+    # load_timestamp = None
+    load_timestamp = "0318-1851"
 
     if load_timestamp:
-        model.load_state_dict(torch.load(f"weight/gpt-{load_timestamp}.pt"))
+        try:
+            model.load_state_dict(torch.load(f"weight/gpt-{load_timestamp}.pt"))
+        except FileNotFoundError:
+            warnings.warn(f"no model checkpoint for {load_timestamp}")
 
     model.to(device)
 
     optimizer = AdamW(model.parameters(), lr=max_lr)
     if load_timestamp:
-        optimizer.load_state_dict(torch.load(f"weight/gpt-{load_timestamp}.opt.pt"))
+        try:
+            optimizer.load_state_dict(torch.load(f"weight/gpt-{load_timestamp}.opt.pt"))
+        except FileNotFoundError:
+            warnings.warn(f"no optimizer checkpoint for {load_timestamp}")
 
     scheduler = SequentialLR(
         optimizer=optimizer,
@@ -156,14 +168,20 @@ if __name__ == "__main__":
         milestones=[warmup_steps, warmup_steps + cosine_steps]
     )
 
+    load_meta = None
     if load_timestamp:
-        with open(f"weight/gpt-{load_timestamp}.json", "r") as f:
-            load_meta = json.load(f)
-    else:
-        load_meta = None
+        try:
+            with open(f"weight/gpt-{load_timestamp}.json", "r") as f:
+                load_meta = json.load(f)
+        except FileNotFoundError:
+            warnings.warn(f"no metadata checkpoint for {load_timestamp}")
 
-    model.train()
-    # model.eval()
+    do_train = False
+
+    if do_train:
+        model.train()
+    else:
+        model.eval()
 
     sum_loss = 0
     sum_tokens = 0
@@ -194,7 +212,8 @@ if __name__ == "__main__":
                 targets.reshape(-1),
                 reduction="sum"
             )
-            loss.backward()
+            if do_train:
+                loss.backward()
 
         optimizer.step()
         scheduler.step()
@@ -209,8 +228,10 @@ if __name__ == "__main__":
             sum_tokens = 0
             sum_loss = 0
             lr = optimizer.param_groups[0]["lr"]
-            print(f"Learning rate: {lr:.6f}, Perplexity: {ppl:.2f}")
-            # print(f"Learning rate: 0, Perplexity: {ppl:.2f}")
+            if do_train:
+                print(f"Learning rate: {lr:.6f}, Perplexity: {ppl:.2f}")
+            else:
+                print(f"Learning rate: 0 (eval), Perplexity: {ppl:.2f}")
 
             ema_loss_numer = avg_loss * ema_loss_alpha + ema_loss_numer * (1 - ema_loss_alpha)
             ema_loss_denom = ema_loss_alpha + ema_loss_denom * (1 - ema_loss_alpha)
@@ -237,7 +258,6 @@ if __name__ == "__main__":
                 },
                 model=model,
                 optimizer=optimizer,
-                scheduler=scheduler,
                 ppl_plot_x=ppl_plot_x,
                 ppl_plot_y=ppl_plot_y,
                 show_plt=True
