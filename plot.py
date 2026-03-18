@@ -10,11 +10,19 @@ def plot_training_curve(iteration: list, ppl: list, show: bool = False, save: st
 
     ax = plt.gca()
     ax.set_yscale("log")
-    ax.set_ylim(top=2500)
+
+    y_lim_ref = ppl[len(ppl) // 20] # ignore first 5%; assumed approximately monotonic
+    y_lim_presets = [125, 250, 490, 1250]
+    y_lim = ([x for x in y_lim_presets if x > y_lim_ref] + [2500])[0]
+    ax.set_ylim(top=y_lim)
+
     ax.grid(True, which='both', axis='both')
 
     ax.yaxis.set_major_locator(
-        ticker.LogLocator(base=10, subs=range(1,6))
+        ticker.LogLocator(
+            base=10,
+            subs=range(1,6) if y_lim > 250 else range(1,10)
+        )
     )
     ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.yaxis.set_minor_formatter(ticker.NullFormatter())
@@ -29,7 +37,7 @@ def plot_training_curve(iteration: list, ppl: list, show: bool = False, save: st
 
 
 if __name__ == "__main__":
-    iteration = list(range(100, 10001, 100))
+    iteration = list(range(100, 90001, 100))
     random.seed(42)
-    ppl = [1.15e7 / (x ** 1.38) * random.gauss(1.0, 0.05) for x in iteration]
+    ppl = [1.15e7 / (x ** 1.38) * random.gauss(1.0, 0.05) + 20 for x in iteration]
     plot_training_curve(iteration, ppl, show=True, save="test.png")
