@@ -32,6 +32,7 @@ save_dir = "weight"
 
 global_no_save = False
 
+
 def save_checkpoint(meta, model, optimizer=None, scheduler=None, ppl_plot_x=None, ppl_plot_y=None, show_plt=False):
     if global_no_save:
         return
@@ -43,8 +44,8 @@ def save_checkpoint(meta, model, optimizer=None, scheduler=None, ppl_plot_x=None
     torch.save(model.state_dict(), f"weight/gpt-{timestamp}.pt")
     if optimizer is not None:
         torch.save(optimizer.state_dict(), f"weight/gpt-{timestamp}.opt.pt")
-    if scheduler is not None:
-        torch.save(scheduler.state_dict(), f"weight/gpt-{timestamp}.sch.pt")
+    # if scheduler is not None:
+    #     torch.save(scheduler.state_dict(), f"weight/gpt-{timestamp}.sch.pt")
     if ppl_plot_x is not None and ppl_plot_y is not None:
         plot_training_curve(
             iteration=ppl_plot_x,
@@ -56,7 +57,7 @@ def save_checkpoint(meta, model, optimizer=None, scheduler=None, ppl_plot_x=None
     print(f"Checkpoint {timestamp} saved; Avg perplexity: {meta['avg_perplexity']}")
 
 
-def preset(name): # n_layers, d_model, n_heads, batch_size, max_lr, min_lr
+def preset(name):  # n_layers, d_model, n_heads, batch_size, max_lr, min_lr
     match name:
         case "smallest":    # 50M params,  9G VRAM
             return 6, 512, 8, 16, 5e-4, 5e-5
@@ -66,8 +67,10 @@ def preset(name): # n_layers, d_model, n_heads, batch_size, max_lr, min_lr
             return 18, 1024, 16, 4, 1e-4, 1e-5
     raise NotImplementedError
 
+
 if __name__ == "__main__":
-    set_seed(42)
+    global_seed = 42
+    set_seed(global_seed)
 
     tokenizer = Tokenizer.from_file("tokenizer/trained.json")
     tokenizer.decoder = ByteLevel()
@@ -89,15 +92,6 @@ if __name__ == "__main__":
 
     device = torch.device("cuda:0")
 
-    # total ~ 80B tokens
-    # est_tokens_per_file = 60000000
-    # est_tokens = len(training_set) * est_tokens_per_file
-    # est_total_steps = est_tokens // batch_size // model.max_len
-    # print(f"Training tokens (est): {est_tokens:,}")
-
-    # warmup_steps = int(est_total_steps * 0.01)
-    # cosine_steps = int(est_total_steps * 0.95)
-
     training_token_coeff = 20.0
     n_batches = int(total_params * training_token_coeff / batch_size / seq_len)
     n_tokens = n_batches * batch_size * seq_len
@@ -106,28 +100,31 @@ if __name__ == "__main__":
     warmup_steps = int(n_batches * 0.01)
     cosine_steps = int(n_batches * 0.95)
 
+    loader_seed_offset = 0
+    dataset_weights = {
+        # web
+        "c4": 40,
+        "fineweb": 40,
+        "openwebtext2": 20,
+
+        # academic
+        "arxiv": 10,
+        "pubmed": 20,
+
+        # literature
+        "book2": 20,
+
+        # wiki
+        "wikipedia": 10
+    }
     loader = DataLoader(
         dataset=MixedTokenStreamDataset(
             path="data",
             n_seq=n_batches * batch_size,
             seq_len=seq_len,
-            dataset_weights={
-                # web
-                "c4": 40,
-                "fineweb" : 40,
-                "openwebtext2" : 20,
-
-                # academic
-                "arxiv" : 10,
-                "pubmed" : 20,
-
-                # literature
-                "book2": 20,
-
-                # wiki
-                "wikipedia" : 10
-            },
-            max_parallel=64
+            dataset_weights=dataset_weights,
+            max_parallel=64,
+            seed=global_seed + loader_seed_offset
         ),
         batch_size=batch_size,
         shuffle=False,
@@ -227,10 +224,13 @@ if __name__ == "__main__":
                     "n_layers": model.n_layers,
                     "n_heads": model.n_heads,
                     "max_len": model.max_len,
+                    "seed": global_seed,
                     "batch_size": batch_size,
                     "max_lr": max_lr,
                     "min_lr": min_lr,
-                    "n_batches" : n_batches,
+                    "dataset_weights": dataset_weights,
+                    "dataset_seed": global_seed + loader_seed_offset,
+                    "n_batches": n_batches,
                     "finished": False,
                     "iteration": pbar.n,
                     "avg_perplexity": math.exp(ema_loss_numer / ema_loss_denom)
@@ -249,10 +249,13 @@ if __name__ == "__main__":
             "n_layers": model.n_layers,
             "n_heads": model.n_heads,
             "max_len": model.max_len,
+            "seed": global_seed,
             "batch_size": batch_size,
             "max_lr": max_lr,
             "min_lr": min_lr,
-            "n_batches" : n_batches,
+            "dataset_weights": dataset_weights,
+            "dataset_seed": global_seed + loader_seed_offset,
+            "n_batches": n_batches,
             "finished": True,
             "iteration": pbar.n,
             "avg_perplexity": math.exp(ema_loss_numer / ema_loss_denom)
