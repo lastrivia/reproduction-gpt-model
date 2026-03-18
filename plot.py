@@ -22,15 +22,14 @@ def plot_training_curve(iteration: list, ppl: list, show: bool = False, save: st
     plt.xlabel("Iteration")
     plt.ylabel("Perplexity (PPL)")
     plt.title("Training Curve")
-    # plt.grid()
-    if show:
-        plt.show()
     if save is not None:
         plt.savefig(save)
+    if show:
+        plt.show()
 
 
 if __name__ == "__main__":
     iteration = list(range(100, 10001, 100))
     random.seed(42)
     ppl = [1.15e7 / (x ** 1.38) * random.gauss(1.0, 0.05) for x in iteration]
-    plot_training_curve(iteration, ppl, show=True)
+    plot_training_curve(iteration, ppl, show=True, save="test.png")
