@@ -5,6 +5,7 @@ import numpy as np
 import glob
 import json
 import random
+
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers
 from tokenizers.decoders import ByteLevel
 import torch
@@ -16,6 +17,7 @@ from tqdm import tqdm
 
 from transformer.transformer import Transformer
 from dataset import MixedTokenStreamDataset
+from plot import plot_training_curve
 
 
 def set_seed(seed: int):
@@ -30,10 +32,11 @@ save_dir = "weight"
 
 global_no_save = False
 
-def save_checkpoint(meta, model, optimizer=None, scheduler=None):
+def save_checkpoint(meta, model, optimizer=None, scheduler=None, ppl_plot_x=None, ppl_plot_y=None, show_plt=False):
     if global_no_save:
         return
     os.makedirs(save_dir, exist_ok=True)
+
     timestamp = time.strftime("%m%d-%H%M")
     with open(f"weight/gpt-{timestamp}.json", "w") as f:
         json.dump(meta, f, indent=4)
@@ -42,6 +45,14 @@ def save_checkpoint(meta, model, optimizer=None, scheduler=None):
         torch.save(optimizer.state_dict(), f"weight/gpt-{timestamp}.opt.pt")
     if scheduler is not None:
         torch.save(scheduler.state_dict(), f"weight/gpt-{timestamp}.sch.pt")
+    if ppl_plot_x is not None and ppl_plot_y is not None:
+        plot_training_curve(
+            iteration=ppl_plot_x,
+            ppl=ppl_plot_y,
+            show=show_plt,
+            save=f"weight/gpt-{timestamp}-curve.png"
+        )
+
     print(f"Checkpoint {timestamp} saved; Avg perplexity: {meta['avg_perplexity']}")
 
 
@@ -166,7 +177,8 @@ if __name__ == "__main__":
     ema_loss_denom = 0
     ema_loss_alpha = 0.1
 
-
+    ppl_plot_x = []
+    ppl_plot_y = []
 
     pbar = tqdm(loader, total=n_batches, mininterval=0)
     for batch in pbar:
@@ -205,6 +217,8 @@ if __name__ == "__main__":
 
             ema_loss_numer = avg_loss * ema_loss_alpha + ema_loss_numer * (1 - ema_loss_alpha)
             ema_loss_denom = ema_loss_alpha + ema_loss_denom * (1 - ema_loss_alpha)
+            ppl_plot_x.append(pbar.n)
+            ppl_plot_y.append(ppl)
 
         if pbar.n and pbar.n % save_interval == 0:
             save_checkpoint(
@@ -223,7 +237,10 @@ if __name__ == "__main__":
                 },
                 model=model,
                 optimizer=optimizer,
-                scheduler=scheduler
+                scheduler=scheduler,
+                ppl_plot_x=ppl_plot_x,
+                ppl_plot_y=ppl_plot_y,
+                show_plt=True
             )
 
     save_checkpoint(
@@ -240,5 +257,8 @@ if __name__ == "__main__":
             "iteration": pbar.n,
             "avg_perplexity": math.exp(ema_loss_numer / ema_loss_denom)
         },
-        model=model
+        model=model,
+        ppl_plot_x=ppl_plot_x,
+        ppl_plot_y=ppl_plot_y,
+        show_plt=True
     )
