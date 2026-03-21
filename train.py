@@ -32,6 +32,9 @@ def set_seed(seed: int):
 save_dir = "weight"
 
 global_no_save = True
+do_train = False
+# load_timestamp = None
+load_timestamp = "0319-224725"
 
 
 def save_checkpoint(meta, model, optimizer=None, ppl_plot_x=None, ppl_plot_y=None, show_plt=False):
@@ -46,7 +49,7 @@ def save_checkpoint(meta, model, optimizer=None, ppl_plot_x=None, ppl_plot_y=Non
 
     os.makedirs(save_dir, exist_ok=True)
 
-    timestamp = time.strftime("%m%d-%H%M")
+    timestamp = time.strftime("%m%d-%H%M%S")
     with open(f"weight/gpt-{timestamp}.json", "w") as f:
         json.dump(meta, f, indent=4)
     torch.save(model.state_dict(), f"weight/gpt-{timestamp}.pt")
@@ -65,11 +68,11 @@ def save_checkpoint(meta, model, optimizer=None, ppl_plot_x=None, ppl_plot_y=Non
 
 def preset(name):  # n_layers, d_model, n_heads, batch_size, max_lr, min_lr
     match name:
-        case "smallest":    # 50M params,  9G VRAM
+        case "smallest":  # 50M params,  9G VRAM
             return 6, 512, 8, 16, 5e-4, 5e-5
-        case "small":       # 151M params, 8G VRAM
+        case "small":  # 151M params, 8G VRAM
             return 12, 768, 12, 8, 2e-4, 2e-5
-        case "medium":      # 353M params, 9G VRAM
+        case "medium":  # 353M params, 9G VRAM
             return 18, 1024, 16, 4, 1e-4, 1e-5
     raise NotImplementedError
 
@@ -83,15 +86,14 @@ if __name__ == "__main__":
     vocab_size = tokenizer.get_vocab_size()
     print("Vocab size:", vocab_size)
 
-    n_layers, d_model, n_heads, batch_size, max_lr, min_lr = preset("smallest")
+    n_layers, d_model, n_heads, batch_size, max_lr, min_lr = preset("small")
     seq_len = 512
 
     model = Transformer(
         n_layers=n_layers,
         d_model=d_model,
         n_heads=n_heads,
-        vocab_size=vocab_size,
-        max_len=seq_len
+        vocab_size=vocab_size
     )
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Params: {total_params:,}")
@@ -105,6 +107,13 @@ if __name__ == "__main__":
 
     warmup_steps = int(n_batches * 0.01)
     cosine_steps = int(n_batches * 0.95)
+
+    stat_interval = 200
+    save_interval = 20000
+
+    save_size = total_params * 12
+    save_times = n_batches // save_interval + 1 if not global_no_save else 0
+    print(f"Size of checkpoints: {save_size * save_times:,}")
 
     loader_seed_offset = 0
     dataset_weights = {
@@ -140,9 +149,6 @@ if __name__ == "__main__":
         persistent_workers=True
     )
 
-    # load_timestamp = None
-    load_timestamp = "0318-1851"
-
     if load_timestamp:
         try:
             model.load_state_dict(torch.load(f"weight/gpt-{load_timestamp}.pt"))
@@ -161,9 +167,9 @@ if __name__ == "__main__":
     scheduler = SequentialLR(
         optimizer=optimizer,
         schedulers=[
-            LinearLR(optimizer, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps), #  1 %
-            CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=min_lr),                 # 95 %
-            ConstantLR(optimizer, factor=min_lr / max_lr, total_iters=n_batches * 999)        # rest
+            LinearLR(optimizer, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps),  # 1 %
+            CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=min_lr),  # 95 %
+            ConstantLR(optimizer, factor=min_lr / max_lr, total_iters=n_batches * 999)  # rest
         ],
         milestones=[warmup_steps, warmup_steps + cosine_steps]
     )
@@ -176,8 +182,6 @@ if __name__ == "__main__":
         except FileNotFoundError:
             warnings.warn(f"no metadata checkpoint for {load_timestamp}")
 
-    do_train = False
-
     if do_train:
         model.train()
     else:
@@ -185,8 +189,6 @@ if __name__ == "__main__":
 
     sum_loss = 0
     sum_tokens = 0
-    stat_interval = 100
-    save_interval = 10000
 
     ema_loss_numer = 0
     ema_loss_denom = 0
@@ -197,7 +199,7 @@ if __name__ == "__main__":
 
     pbar = tqdm(loader, total=n_batches, mininterval=0)
     for batch in pbar:
-        if load_meta and pbar.n < load_meta["iteration"]:
+        if do_train and load_meta and pbar.n < load_meta["iteration"]:
             scheduler.step()
             continue
 

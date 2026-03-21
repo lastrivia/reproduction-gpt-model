@@ -1,11 +1,11 @@
 import math
-
 import torch
 from torch import nn
 from typing import Optional, Tuple
 
 from .attention import Attention
 from .swiglu import SwiGLU
+from .kv_cache import KVCacheLayer, KVCache
 
 
 class DecoderBlock(nn.Module):
@@ -28,8 +28,8 @@ class DecoderBlock(nn.Module):
         )
         self.dropout_2 = nn.Dropout(dropout)
 
-    def forward(self, x):
-        x = x + self.dropout_1(self.attn(self.norm_1(x)))
+    def forward(self, x: torch.Tensor, kv_cache: Optional[KVCacheLayer] = None) -> torch.Tensor:
+        x = x + self.dropout_1(self.attn(self.norm_1(x), kv_cache=kv_cache))
         x = x + self.dropout_2(self.ffn(self.norm_2(x)))
         return x
 
@@ -37,18 +37,16 @@ class DecoderBlock(nn.Module):
 class Transformer(nn.Module):
     def __init__(
             self,
-            n_layers: int, d_model: int, n_heads: int,
-            vocab_size: int, max_len: int
+            n_layers: int, d_model: int, n_heads: int, vocab_size: int
     ):
         super(Transformer, self).__init__()
         if d_model % (2 * n_heads) != 0:
-            raise ValueError('d_model must be divisible by (2 * n_heads)') # d_rope == d_head // 2
+            raise ValueError('d_model must be divisible by (2 * n_heads)')  # d_rope == d_head // 2
         self.n_layers = n_layers
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.vocab_size = vocab_size
-        self.max_len = max_len
 
         # Layers
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -59,10 +57,10 @@ class Transformer(nn.Module):
         ])
         self.final_ln = nn.LayerNorm(d_model)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, kv_cache: Optional[KVCache] = None) -> torch.Tensor:
         x = self.embedding(x)
-        for decoder in self.decoders:
-            x = decoder(x)
+        for i in range(self.n_layers):
+            x = self.decoders[i](x, kv_cache=kv_cache[i] if kv_cache else None)
         x = self.final_ln(x)
         logits = x @ self.embedding.weight.T
         return logits

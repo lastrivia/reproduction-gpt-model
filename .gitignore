@@ -6,6 +6,3 @@
 weight/
 .idea/
 **/__pycache__/**
-
-# todo
-**/kv_cache.py
