@@ -86,7 +86,7 @@ if __name__ == "__main__":
     vocab_size = tokenizer.get_vocab_size()
     print("Vocab size:", vocab_size)
 
-    n_layers, d_model, n_heads, batch_size, max_lr, min_lr = preset("small")
+    n_layers, d_model, n_heads, batch_size, max_lr, min_lr = preset("medium")
     seq_len = 512
 
     model = Transformer(
@@ -246,7 +246,7 @@ if __name__ == "__main__":
                     "d_model": model.d_model,
                     "n_layers": model.n_layers,
                     "n_heads": model.n_heads,
-                    "max_len": model.max_len,
+                    "max_len": seq_len,
                     "seed": global_seed,
                     "batch_size": batch_size,
                     "max_lr": max_lr,
@@ -270,7 +270,7 @@ if __name__ == "__main__":
             "d_model": model.d_model,
             "n_layers": model.n_layers,
             "n_heads": model.n_heads,
-            "max_len": model.max_len,
+            "max_len": seq_len,
             "seed": global_seed,
             "batch_size": batch_size,
             "max_lr": max_lr,
