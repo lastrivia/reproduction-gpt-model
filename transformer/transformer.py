@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 from .attention import Attention
 from .swiglu import SwiGLU
-from .kv_cache import KVCacheLayer, KVCache
+from .kv_cache import KVCache, KVCacheList
 
 
 class DecoderBlock(nn.Module):
@@ -28,7 +28,7 @@ class DecoderBlock(nn.Module):
         )
         self.dropout_2 = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, kv_cache: Optional[KVCacheLayer] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache: Optional[KVCache] = None) -> torch.Tensor:
         x = x + self.dropout_1(self.attn(self.norm_1(x), kv_cache=kv_cache))
         x = x + self.dropout_2(self.ffn(self.norm_2(x)))
         return x
@@ -57,7 +57,7 @@ class Transformer(nn.Module):
         ])
         self.final_ln = nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor, kv_cache: Optional[KVCache] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache: Optional[KVCacheList] = None) -> torch.Tensor:
         x = self.embedding(x)
         for i in range(self.n_layers):
             x = self.decoders[i](x, kv_cache=kv_cache[i] if kv_cache else None)

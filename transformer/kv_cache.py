@@ -2,7 +2,7 @@ import torch
 from typing import Tuple
 
 
-class KVCacheLayer:
+class KVCache:
     def __init__(self, batch_size, n_heads, max_len, d_head, device, dtype):
         self.k = torch.empty(
             [batch_size, n_heads, max_len, d_head],
@@ -31,10 +31,10 @@ class KVCacheLayer:
         self.cache_len = 0
 
 
-class KVCache:
+class KVCacheList:
     def __init__(self, n_layers, batch_size, n_heads, max_len, d_head, device, dtype):
         self.layers = [
-            KVCacheLayer(batch_size, n_heads, max_len, d_head, device, dtype)
+            KVCache(batch_size, n_heads, max_len, d_head, device, dtype)
             for _ in range(n_layers)
         ]
 

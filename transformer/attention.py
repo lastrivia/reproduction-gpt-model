@@ -4,7 +4,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from typing import Optional
 
 from .rope import get_rope_cache, apply_rope
-from .kv_cache import KVCacheLayer
+from .kv_cache import KVCache
 
 
 class Attention(nn.Module):
@@ -19,7 +19,8 @@ class Attention(nn.Module):
         self.w_qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=True)
 
-    def forward(self, x: torch.Tensor, kv_cache: Optional[KVCacheLayer] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache: Optional[KVCache] = None) -> torch.Tensor:
+        # pylint: disable=not-callable
         batch_size = x.shape[0]
         seq_len = x.shape[1]
 
