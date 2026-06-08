@@ -98,7 +98,7 @@ if __name__ == "__main__":
     set_seed(global_seed)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        "allenai/dolma2-tokenizer",
+        "allenai/gpt-neox-olmo-dolma-v1_5",
         use_fast=True,
     )
     vocab_size = len(tokenizer)

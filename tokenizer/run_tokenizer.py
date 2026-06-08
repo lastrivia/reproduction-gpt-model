@@ -82,7 +82,7 @@ def tokenization_worker(file: str | Path):
 if __name__ == "__main__":
 
     test_tokenizer = AutoTokenizer.from_pretrained(
-        "allenai/dolma2-tokenizer",
+        "allenai/gpt-neox-olmo-dolma-v1_5",
         use_fast=True,
     )
     if test_tokenizer.eos_token_id is None:
