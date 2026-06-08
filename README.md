@@ -1,6 +1,6 @@
 ## GPT Pretraining Reproduction
 
-A compact PyTorch reproduction project for GPT-style pretraining. The repository implements a desktop-scale language model pipeline covering corpus processing, Byte-Level BPE tokenizer training, decoder-only Transformer pretraining, checkpointing, and interactive text generation.
+A compact PyTorch reproduction project for GPT-style pretraining. The repository implements a desktop-scale language model pipeline covering corpus processing, tokenizer-based binary compression, decoder-only Transformer pretraining, checkpointing, and training curve plotting.
 
 ### Overview
 
@@ -9,46 +9,45 @@ This project reproduces a desktop-scale GPT-style pretraining pipeline, with the
 Main features:
 
 - Hand-written decoder-only Transformer components, including RoPE and KV Cache.
-- Byte-Level BPE tokenizer training and tokenization.
-- Corpus download, chunking, language filtering, and tokenized binary compression scripts.
-- Weighted mixed-corpus streaming dataset for multiple English corpora.
+- Hugging Face tokenizer-based tokenization.
+- Dataset-local corpus indexing, downloading, chunking, shuffling, and tokenized binary compression scripts.
 - Preset model configurations from about 50M to 350M parameters.
-- Checkpointing, training curve plotting, and interactive text generation.
+- Checkpointing, resumable single-dataset loading, and training curve plotting.
 
 ### Usage
 
 #### Data Preparation
 
-1. Download corpora with `data/*/download.py`.
-2. Convert raw corpora into parquet chunks with `data/chunk_*.py`.
-3. Train a Byte-Level BPE tokenizer with `tokenizer/train.py`.
-4. Convert parquet chunks into compressed token chunks with `tokenizer/tokenize.py`.
-5. Use `dataset.py` to stream fixed-length token sequences from multiple datasets according to configured sampling weights.
+For each dataset under `data/*/`, run the dataset-local preparation scripts in order:
 
-The current training configuration mixes web, academic, literature, and wiki-style corpora, including C4, FineWeb, OpenWebText2, arXiv, PubMed, BookCorpus2, Wikipedia, and WikiText.
+```bash
+cd data/<dataset>
+python index.py
+python download.py
+python chunk.py
+python chunk_shuffle.py
+```
 
-Train the tokenizer:
+Then tokenize the shuffled parquet chunks:
 
 ```bash
 cd tokenizer
-python train.py
+python run_tokenizer.py
 ```
 
-#### Pre-training & Inference
+The current training configuration uses a single prepared dataset, such as `fineweb-edu`.
 
-Run pretraining or evaluation:
+#### Pre-training
+
+Run pretraining:
 
 ```bash
 python train.py
 ```
 
-Before running, check the local settings in `train.py`, especially `preset`, `do_train`, `global_no_save`, and `load_timestamp`.
+Before running, check the local settings in `train.py`, especially `model_preset`, `residual_arch`, `do_train`, `global_no_save`, and `load_timestamp`.
 
-Run interactive text generation:
-
-```bash
-python infer.py
-```
+*Evaluation and the new interactive inference path are TODO.*
 
 ### Model Presets
 
@@ -60,6 +59,12 @@ python infer.py
 | `small` | 12 | 768 | 12 | 151M |
 | `medium` | 18 | 1024 | 16 | 353M |
 
+`residual_arch` selects the residual-stream architecture:
+
+- `vanilla`: standard decoder-only Transformer residual stream, following Transformer-style residual blocks.
+- `hc`: Hyper-Connections, which expand the residual stream into multiple streams and learn cross-depth feature routing ([Zhu et al., 2024](https://arxiv.org/abs/2409.19606)).
+- `mhc`: *TODO.* Manifold-Constrained Hyper-Connections constrain the HC residual mixing space to improve identity mapping and efficiency ([Xie et al., 2025](https://arxiv.org/abs/2512.24880)).
+
 Training uses AdamW with warmup, cosine decay, and a final constant learning-rate stage. Perplexity is used as the main monitoring metric.
 
 ### Source Structure
@@ -67,21 +72,21 @@ Training uses AdamW with warmup, cosine decay, and a final constant learning-rat
 ```text
 .
 |-- data/                  # Data download, cleaning, chunking, and statistics scripts
-|   |-- */download.py      # Dataset-specific download scripts
-|   `-- chunk_*.py         # Convert raw corpora into parquet chunks
-|-- tokenizer/             # Tokenizer training and tokenization tools
-|   |-- train.py           # Train the Byte-Level BPE tokenizer
-|   |-- tokenize.py        # Convert parquet text chunks into token chunks
-|   `-- trained.json       # Trained tokenizer file
+|   |-- manifest.py        # Tokenized chunk manifest generation
+|   `-- */                 # Dataset-specific index/download/chunk/shuffle scripts
+|-- tokenizer/             # Tokenizer and tokenization tools
+|   |-- tokenizer/         # Local saved Hugging Face tokenizer
+|   |-- run_tokenizer.py   # Convert shuffled parquet chunks into token chunks
+|   `-- bin_preview.py     # Inspect compressed token chunks
 |-- transformer/           # Transformer model implementation
-|   |-- transformer.py     # DecoderBlock and Transformer modules
+|   |-- transformer.py     # Vanilla DecoderBlock and Transformer modules
+|   |-- hc_transformer.py  # HC-style Transformer variant
 |   |-- attention.py       # Causal attention and KV Cache attention
 |   |-- rope.py            # RoPE positional encoding
 |   |-- swiglu.py          # SwiGLU activation module
 |   `-- kv_cache.py        # KV Cache implementation for inference
 |-- weight/                # Checkpoints and training curve outputs
-|-- dataset.py             # Mixed-corpus streaming Dataset
-|-- train.py               # Pretraining and evaluation entry point
-|-- infer.py               # Interactive text generation entry point
+|-- loader.py              # Single-dataset token batch loader
+|-- train.py               # Pretraining entry point
 `-- plot.py                # Training curve plotting utility
 ```
