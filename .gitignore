@@ -1,8 +1,8 @@
-**/*.parquet
-**/*.bin
-**/*.zst
-**/downloaded
-**/*_token
+data/*/*/
+data/*/*.json
+
 weight/
+tokenizer/tokenizer/
+
 .idea/
-**/__pycache__/**
+**/__pycache__/

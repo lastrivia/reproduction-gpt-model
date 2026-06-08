@@ -1,23 +1,21 @@
 import math
 import time
 import os
-import warnings
 import numpy as np
-import glob
 import json
 import random
+from tqdm import tqdm
 
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers
-from tokenizers.decoders import ByteLevel
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, ConstantLR
 from torch.nn.functional import cross_entropy
-from tqdm import tqdm
+from transformers import AutoTokenizer
 
 from transformer.transformer import Transformer
-from dataset import MixedTokenStreamDataset
+from transformer.hc_transformer import HCTransformer
+from loader import TokenizedBatchDataset
 from plot import plot_training_curve
 
 
@@ -29,15 +27,29 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-save_dir = "weight"
+global_no_save = False
+do_train = True
+load_timestamp = None
+# load_timestamp = "0319-224725"
 
-global_no_save = True
-do_train = False
-# load_timestamp = None
-load_timestamp = "0319-224725"
+model_preset = "small"  # smallest | small | medium
+residual_arch = "vanilla"  # vanilla | hc | mhc
+save_dir = "weight/small-vanilla-0608"
+
+hc_expansion_rate = 2
+hc_dynamic = False
+hc_tanh = False
 
 
-def save_checkpoint(meta, model, optimizer=None, ppl_plot_x=None, ppl_plot_y=None, show_plt=False):
+def save_checkpoint(
+        meta, 
+        model, 
+        optimizer=None, 
+        scheduler=None,
+        ppl_plot_x=None, 
+        ppl_plot_y=None, 
+        show_plt=False,
+):
     if global_no_save:
         if ppl_plot_x is not None and ppl_plot_y is not None:
             plot_training_curve(
@@ -50,17 +62,21 @@ def save_checkpoint(meta, model, optimizer=None, ppl_plot_x=None, ppl_plot_y=Non
     os.makedirs(save_dir, exist_ok=True)
 
     timestamp = time.strftime("%m%d-%H%M%S")
-    with open(f"weight/gpt-{timestamp}.json", "w") as f:
+    with open(f"{save_dir}/gpt-{timestamp}.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=4)
-    torch.save(model.state_dict(), f"weight/gpt-{timestamp}.pt")
+    torch.save(model.state_dict(), f"{save_dir}/gpt-{timestamp}.pt")
+
     if optimizer is not None:
-        torch.save(optimizer.state_dict(), f"weight/gpt-{timestamp}.opt.pt")
+        torch.save(optimizer.state_dict(), f"{save_dir}/gpt-{timestamp}.opt.pt")
+    if scheduler is not None:
+        torch.save(scheduler.state_dict(), f"{save_dir}/gpt-{timestamp}.sch.pt")
+
     if ppl_plot_x is not None and ppl_plot_y is not None:
         plot_training_curve(
             iteration=ppl_plot_x,
             ppl=ppl_plot_y,
             show=show_plt,
-            save=f"weight/gpt-{timestamp}-curve.png"
+            save=f"{save_dir}/gpt-{timestamp}-curve.png"
         )
 
     print(f"Checkpoint {timestamp} saved; Avg perplexity: {meta['avg_perplexity']}")
@@ -81,20 +97,39 @@ if __name__ == "__main__":
     global_seed = 42
     set_seed(global_seed)
 
-    tokenizer = Tokenizer.from_file("tokenizer/trained.json")
-    tokenizer.decoder = ByteLevel()
-    vocab_size = tokenizer.get_vocab_size()
+    tokenizer = AutoTokenizer.from_pretrained(
+        "allenai/dolma2-tokenizer",
+        use_fast=True,
+    )
+    vocab_size = len(tokenizer)
     print("Vocab size:", vocab_size)
 
-    n_layers, d_model, n_heads, batch_size, max_lr, min_lr = preset("medium")
+    n_layers, d_model, n_heads, batch_size, max_lr, min_lr = preset(model_preset)
+    weight_decay = 0.01
     seq_len = 512
 
-    model = Transformer(
-        n_layers=n_layers,
-        d_model=d_model,
-        n_heads=n_heads,
-        vocab_size=vocab_size
-    )
+    if residual_arch == "vanilla":
+        model = Transformer(
+            n_layers=n_layers,
+            d_model=d_model,
+            n_heads=n_heads,
+            vocab_size=vocab_size,
+            dropout=0.1,
+        )
+    elif residual_arch == "hc":
+        model = HCTransformer(
+            n_layers=n_layers,
+            d_model=d_model,
+            n_heads=n_heads,
+            vocab_size=vocab_size,
+            dropout=0.1,
+            expansion_rate=hc_expansion_rate,
+            dynamic=hc_dynamic,
+            tanh=hc_tanh,
+        )
+    else:
+        raise NotImplementedError
+    
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Params: {total_params:,}")
 
@@ -115,72 +150,66 @@ if __name__ == "__main__":
     save_times = n_batches // save_interval + 1 if not global_no_save else 0
     print(f"Size of checkpoints: {save_size * save_times:,}")
 
-    loader_seed_offset = 0
-    dataset_weights = {
-        # web
-        "c4": 40,
-        "fineweb": 40,
-        "openwebtext2": 20,
 
-        # academic
-        "arxiv": 10,
-        "pubmed": 20,
+    if load_timestamp is None:
+        # Train from scratch
+        model.to(device)
 
-        # literature
-        "book2": 20,
+        optimizer = AdamW(model.param_groups(weight_decay=weight_decay), lr=max_lr)
 
-        # wiki
-        "wikipedia": 10
-    }
+        scheduler = SequentialLR(
+            optimizer=optimizer,
+            schedulers=[
+                LinearLR(optimizer, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps),  # 1 %
+                CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=min_lr),  # 95 %
+                ConstantLR(optimizer, factor=min_lr / max_lr, total_iters=n_batches * 999)  # rest
+            ],
+            milestones=[warmup_steps, warmup_steps + cosine_steps]
+        )
+
+        start_batch_idx = 0
+
+    else:
+        # Load checkpoint
+        model.load_state_dict(torch.load(f"{save_dir}/gpt-{load_timestamp}.pt"))
+        model.to(device)
+
+        optimizer = AdamW(model.param_groups(weight_decay=weight_decay), lr=max_lr)
+        optimizer.load_state_dict(torch.load(f"{save_dir}/gpt-{load_timestamp}.opt.pt"))
+
+        scheduler = SequentialLR(
+            optimizer=optimizer,
+            schedulers=[
+                LinearLR(optimizer, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps),  # 1 %
+                CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=min_lr),  # 95 %
+                ConstantLR(optimizer, factor=min_lr / max_lr, total_iters=n_batches * 999)  # rest
+            ],
+            milestones=[warmup_steps, warmup_steps + cosine_steps]
+        )
+        scheduler.load_state_dict(torch.load(f"{save_dir}/gpt-{load_timestamp}.sch.pt"))
+
+        with open(f"{save_dir}/gpt-{load_timestamp}.json", "r", encoding="utf-8") as f:
+            load_meta = json.load(f)
+
+        start_batch_idx = load_meta["iteration"] + 1
+
+    model = torch.compile(model)
+
+    dataset_name = "fineweb-edu"
     loader = DataLoader(
-        dataset=MixedTokenStreamDataset(
-            path="data",
-            n_seq=n_batches * batch_size,
+        TokenizedBatchDataset(
+            dataset=dataset_name,
             seq_len=seq_len,
-            dataset_weights=dataset_weights,
-            max_parallel=64,
-            seed=global_seed + loader_seed_offset
+            batch_size=batch_size,
+            start_batch_idx=start_batch_idx,
+            max_batches=n_batches - start_batch_idx,
         ),
-        batch_size=batch_size,
-        shuffle=False,
+        batch_size=None,
         num_workers=1,
-        pin_memory=True,
         prefetch_factor=2,
-        persistent_workers=True
+        persistent_workers=True,
+        pin_memory=True,
     )
-
-    if load_timestamp:
-        try:
-            model.load_state_dict(torch.load(f"weight/gpt-{load_timestamp}.pt"))
-        except FileNotFoundError:
-            warnings.warn(f"no model checkpoint for {load_timestamp}")
-
-    model.to(device)
-
-    optimizer = AdamW(model.parameters(), lr=max_lr)
-    if load_timestamp:
-        try:
-            optimizer.load_state_dict(torch.load(f"weight/gpt-{load_timestamp}.opt.pt"))
-        except FileNotFoundError:
-            warnings.warn(f"no optimizer checkpoint for {load_timestamp}")
-
-    scheduler = SequentialLR(
-        optimizer=optimizer,
-        schedulers=[
-            LinearLR(optimizer, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps),  # 1 %
-            CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=min_lr),  # 95 %
-            ConstantLR(optimizer, factor=min_lr / max_lr, total_iters=n_batches * 999)  # rest
-        ],
-        milestones=[warmup_steps, warmup_steps + cosine_steps]
-    )
-
-    load_meta = None
-    if load_timestamp:
-        try:
-            with open(f"weight/gpt-{load_timestamp}.json", "r") as f:
-                load_meta = json.load(f)
-        except FileNotFoundError:
-            warnings.warn(f"no metadata checkpoint for {load_timestamp}")
 
     if do_train:
         model.train()
@@ -197,11 +226,9 @@ if __name__ == "__main__":
     ppl_plot_x = []
     ppl_plot_y = []
 
-    pbar = tqdm(loader, total=n_batches, mininterval=0)
+    pbar = tqdm(loader, total=n_batches, initial=start_batch_idx, mininterval=0, ncols=80)
+
     for batch in pbar:
-        if do_train and load_meta and pbar.n < load_meta["iteration"]:
-            scheduler.step()
-            continue
 
         batch = batch.to(device)
         inputs = batch[:, :-1]
@@ -217,14 +244,15 @@ if __name__ == "__main__":
             if do_train:
                 loss.backward()
 
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad()
+        if do_train:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
         sum_tokens += targets.numel()
         sum_loss += loss.item()
 
-        if pbar.n and pbar.n % stat_interval == 0:
+        if (pbar.n + 1) % stat_interval == 0:
             avg_loss = sum_loss / sum_tokens
             ppl = math.exp(avg_loss)
             sum_tokens = 0
@@ -240,19 +268,19 @@ if __name__ == "__main__":
             ppl_plot_x.append(pbar.n)
             ppl_plot_y.append(ppl)
 
-        if pbar.n and pbar.n % save_interval == 0:
+        if (pbar.n + 1) % save_interval == 0:
             save_checkpoint(
                 meta={
                     "d_model": model.d_model,
                     "n_layers": model.n_layers,
                     "n_heads": model.n_heads,
-                    "max_len": seq_len,
+                    "seq_len": seq_len,
                     "seed": global_seed,
                     "batch_size": batch_size,
                     "max_lr": max_lr,
                     "min_lr": min_lr,
-                    "dataset_weights": dataset_weights,
-                    "dataset_seed": global_seed + loader_seed_offset,
+                    "weight_decay": weight_decay,
+                    "dataset": dataset_name,
                     "n_batches": n_batches,
                     "finished": False,
                     "iteration": pbar.n,
@@ -260,9 +288,10 @@ if __name__ == "__main__":
                 },
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 ppl_plot_x=ppl_plot_x,
                 ppl_plot_y=ppl_plot_y,
-                show_plt=True
+                show_plt=False
             )
 
     save_checkpoint(
@@ -270,20 +299,20 @@ if __name__ == "__main__":
             "d_model": model.d_model,
             "n_layers": model.n_layers,
             "n_heads": model.n_heads,
-            "max_len": seq_len,
+            "seq_len": seq_len,
             "seed": global_seed,
             "batch_size": batch_size,
             "max_lr": max_lr,
             "min_lr": min_lr,
-            "dataset_weights": dataset_weights,
-            "dataset_seed": global_seed + loader_seed_offset,
+            "weight_decay": weight_decay,
+            "dataset": dataset_name,
             "n_batches": n_batches,
             "finished": True,
-            "iteration": pbar.n,
+            "iteration": pbar.n - 1,
             "avg_perplexity": math.exp(ema_loss_numer / ema_loss_denom)
         },
         model=model,
         ppl_plot_x=ppl_plot_x,
         ppl_plot_y=ppl_plot_y,
-        show_plt=True
+        show_plt=False
     )

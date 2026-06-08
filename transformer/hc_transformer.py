@@ -183,29 +183,35 @@ class HCTransformer(nn.Module):
         x = self.final_ln(h.sum(dim=-2, keepdim=False))
         logits = x @ self.embedding.weight.T
         return logits
+    
 
-def build_param_groups(model, weight_decay):
-    decay = []
-    no_decay = []
+    def param_groups(
+        self,
+        weight_decay: float,
+    ):
+        decay = []
+        no_decay = []
 
-    hc_static_ids = set()
-    for module in model.modules():
-        if isinstance(module, HyperConnectionBlock):
-            hc_static_ids.add(id(module.a))
-            hc_static_ids.add(id(module.b))
+        hc_static_ids = set()
 
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
+        for module in self.modules():
+            if isinstance(module, HyperConnectionBlock):
+                hc_static_ids.add(id(module.a))
+                hc_static_ids.add(id(module.b))
 
-        if id(p) in hc_static_ids:
-            no_decay.append(p)
-        elif p.ndim <= 1 or name.endswith(".bias"):
-            no_decay.append(p)
-        else:
-            decay.append(p)
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
 
-    return [
-        {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ]
+            if id(p) in hc_static_ids:
+                no_decay.append(p)
+            elif p.ndim <= 1 or name.endswith(".bias"):
+                # bias / norm / scalar gate
+                no_decay.append(p)
+            else:
+                decay.append(p)
+
+        return [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]

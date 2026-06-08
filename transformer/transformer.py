@@ -37,7 +37,8 @@ class DecoderBlock(nn.Module):
 class Transformer(nn.Module):
     def __init__(
             self,
-            n_layers: int, d_model: int, n_heads: int, vocab_size: int
+            n_layers: int, d_model: int, n_heads: int, vocab_size: int,
+            dropout: float = 0.1
     ):
         super(Transformer, self).__init__()
         if d_model % (2 * n_heads) != 0:
@@ -52,7 +53,7 @@ class Transformer(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
         self.decoders = nn.ModuleList([
-            DecoderBlock(d_model=d_model, n_heads=n_heads)
+            DecoderBlock(d_model=d_model, n_heads=n_heads, dropout=dropout)
             for _ in range(n_layers)
         ])
         self.final_ln = nn.LayerNorm(d_model)
@@ -64,3 +65,27 @@ class Transformer(nn.Module):
         x = self.final_ln(x)
         logits = x @ self.embedding.weight.T
         return logits
+    
+
+    def param_groups(
+        self,
+        weight_decay: float,
+    ):
+        decay = []
+        no_decay = []
+
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+
+            if p.ndim <= 1 or name.endswith(".bias"):
+                # bias / norm / scalar gate
+                no_decay.append(p)
+            else:
+                decay.append(p)
+
+        return [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
