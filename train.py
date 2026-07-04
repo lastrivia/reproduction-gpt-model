@@ -27,18 +27,22 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-global_no_save = False
+do_save_checkpoints = True
+do_remove_old_checkpoints = True
 do_train = True
 load_timestamp = None
-# load_timestamp = "0319-224725"
+# load_timestamp = "0613-165817"
 
-model_preset = "small"  # smallest | small | medium
+model_preset = "medium-server"  # smallest | small | medium | medium-server | large-server
 residual_arch = "vanilla"  # vanilla | hc | mhc
-save_dir = "weight/small-vanilla-0608"
+save_dir = "weight/test"
 
 hc_expansion_rate = 2
-hc_dynamic = False
-hc_tanh = False
+hc_dynamic = True
+hc_tanh = True
+
+
+chinchilla_coeff = None # 20.0
 
 
 def save_checkpoint(
@@ -50,7 +54,7 @@ def save_checkpoint(
         ppl_plot_y=None, 
         show_plt=False,
 ):
-    if global_no_save:
+    if not do_save_checkpoints:
         if ppl_plot_x is not None and ppl_plot_y is not None:
             plot_training_curve(
                 iteration=ppl_plot_x,
@@ -58,6 +62,11 @@ def save_checkpoint(
                 show=show_plt
             )
         return
+    
+    if do_remove_old_checkpoints:
+        pass # todo
+
+    # todo: save & load ppl curve
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -82,14 +91,26 @@ def save_checkpoint(
     print(f"Checkpoint {timestamp} saved; Avg perplexity: {meta['avg_perplexity']}")
 
 
-def preset(name):  # n_layers, d_model, n_heads, batch_size, max_lr, min_lr
+def preset(name):  # n_layers, d_model, n_heads, batch_size, seq_len, preset_training_batches, max_lr, min_lr
     match name:
-        case "smallest":  # 50M params,  9G VRAM
-            return 6, 512, 8, 16, 5e-4, 5e-5
-        case "small":  # 151M params, 8G VRAM
-            return 12, 768, 12, 8, 2e-4, 2e-5
-        case "medium":  # 353M params, 9G VRAM
-            return 18, 1024, 16, 4, 1e-4, 1e-5
+
+        case "smallest":
+            # 50,953,216 vanilla params, 9G VRAM
+            return 6, 512, 8, 16, 512, 124397, 5e-4, 5e-5
+        case "small":
+            # 151,991,808 vanilla params, 8G VRAM
+            return 12, 768, 12, 8, 512, 742147, 2e-4, 2e-5
+        case "medium":
+            # 353,736,704 vanilla params, 9G VRAM
+            return 18, 1024, 16, 4, 512, 3454460, 1e-4, 1e-5
+
+        case "medium-server":
+            # 353,736,704 vanilla params
+            return 18, 1024, 16, 8, 2048, 431807, 2e-4, 2e-5
+        case "large-server":
+            # 693,936,640 vanilla params
+            return 24, 1280, 20, 4, 2048, 1694181, 1e-4, 1e-5
+
     raise NotImplementedError
 
 
@@ -104,9 +125,8 @@ if __name__ == "__main__":
     vocab_size = len(tokenizer)
     print("Vocab size:", vocab_size)
 
-    n_layers, d_model, n_heads, batch_size, max_lr, min_lr = preset(model_preset)
+    n_layers, d_model, n_heads, batch_size, seq_len, preset_training_batches, max_lr, min_lr = preset(model_preset)
     weight_decay = 0.01
-    seq_len = 512
 
     if residual_arch == "vanilla":
         model = Transformer(
@@ -129,14 +149,14 @@ if __name__ == "__main__":
         )
     else:
         raise NotImplementedError
-    
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Params: {total_params:,}")
-
-    device = torch.device("cuda:0")
-
-    training_token_coeff = 20.0
-    n_batches = int(total_params * training_token_coeff / batch_size / seq_len)
+    
+    if chinchilla_coeff is not None:
+        n_batches = int(total_params * chinchilla_coeff / batch_size / seq_len)
+    else:
+        n_batches = preset_training_batches
     n_tokens = n_batches * batch_size * seq_len
     print(f"Training tokens: {n_tokens:,}")
 
@@ -147,9 +167,10 @@ if __name__ == "__main__":
     save_interval = 20000
 
     save_size = total_params * 12
-    save_times = n_batches // save_interval + 1 if not global_no_save else 0
+    save_times = n_batches // save_interval + 1 if do_save_checkpoints else 0
     print(f"Size of checkpoints: {save_size * save_times:,}")
 
+    device = torch.device("cuda:0")
 
     if load_timestamp is None:
         # Train from scratch
@@ -192,8 +213,6 @@ if __name__ == "__main__":
             load_meta = json.load(f)
 
         start_batch_idx = load_meta["iteration"] + 1
-
-    model = torch.compile(model)
 
     dataset_name = "fineweb-edu"
     loader = DataLoader(
