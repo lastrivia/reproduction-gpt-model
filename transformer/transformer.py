@@ -6,21 +6,22 @@ from typing import Optional, Tuple
 from .attention import Attention
 from .swiglu import SwiGLU
 from .kv_cache import KVCache, KVCacheList
+from .utils import get_module_class
 
 
 class DecoderBlock(nn.Module):
     def __init__(
-            self,
+            self, *,
             d_model: int, n_heads: int,
-            dropout: float = 0.1
+            norm: str, dropout: float
     ):
         super().__init__()
 
-        self.norm_1 = nn.LayerNorm(d_model)
+        self.norm_1 = get_module_class(norm)(d_model)
         self.attn = Attention(d_model, n_heads)
         self.dropout_1 = nn.Dropout(dropout)
 
-        self.norm_2 = nn.LayerNorm(d_model)
+        self.norm_2 = get_module_class(norm)(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 8),
             SwiGLU(),
@@ -36,9 +37,9 @@ class DecoderBlock(nn.Module):
 
 class Transformer(nn.Module):
     def __init__(
-            self,
+            self, *,
             n_layers: int, d_model: int, n_heads: int, vocab_size: int,
-            dropout: float = 0.1
+            norm: str, dropout: float,
     ):
         super(Transformer, self).__init__()
         if d_model % (2 * n_heads) != 0:
@@ -53,16 +54,16 @@ class Transformer(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
         self.decoders = nn.ModuleList([
-            DecoderBlock(d_model=d_model, n_heads=n_heads, dropout=dropout)
+            DecoderBlock(d_model=d_model, n_heads=n_heads, norm=norm, dropout=dropout)
             for _ in range(n_layers)
         ])
-        self.final_ln = nn.LayerNorm(d_model)
+        self.final_norm = get_module_class(norm)(d_model)
 
     def forward(self, x: torch.Tensor, kv_cache: Optional[KVCacheList] = None) -> torch.Tensor:
         x = self.embedding(x)
         for i in range(self.n_layers):
             x = self.decoders[i](x, kv_cache=kv_cache[i] if kv_cache else None)
-        x = self.final_ln(x)
+        x = self.final_norm(x)
         logits = x @ self.embedding.weight.T
         return logits
     
@@ -88,4 +89,3 @@ class Transformer(nn.Module):
             {"params": decay, "weight_decay": weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ]
-

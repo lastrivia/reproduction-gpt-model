@@ -1,7 +1,7 @@
 data/*/*/
 data/*/*.json
 
-weight/
+results/
 tokenizer/tokenizer/
 
 .idea/

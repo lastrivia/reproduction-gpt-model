@@ -4,9 +4,9 @@ from matplotlib import pyplot as plt
 import matplotlib.ticker as ticker
 
 
-def plot_training_curve(iteration: list, ppl: list, show: bool = False, save: str = None):
+def plot_training_curve(step: list, ppl: list, show: bool = False, save: str = None):
     plt.figure(figsize=(8, 6))
-    plt.plot(iteration, ppl)
+    plt.plot(step, ppl)
 
     ax = plt.gca()
     ax.set_yscale("log")
@@ -27,17 +27,18 @@ def plot_training_curve(iteration: list, ppl: list, show: bool = False, save: st
     ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
     ax.yaxis.set_minor_formatter(ticker.NullFormatter())
 
-    plt.xlabel("Iteration")
+    plt.xlabel("Step")
     plt.ylabel("Perplexity (PPL)")
     plt.title("Training Curve")
     if save is not None:
         plt.savefig(save)
     if show:
         plt.show()
+    plt.close("all")
 
 
 if __name__ == "__main__":
-    iteration = list(range(100, 90001, 100))
+    step = list(range(100, 90001, 100))
     random.seed(42)
-    ppl = [1.15e7 / (x ** 1.38) * random.gauss(1.0, 0.05) + 20 for x in iteration]
-    plot_training_curve(iteration, ppl, show=True, save="test.png")
+    ppl = [1.15e7 / (x ** 1.38) * random.gauss(1.0, 0.05) + 20 for x in step]
+    plot_training_curve(step, ppl, show=True, save="test.png")

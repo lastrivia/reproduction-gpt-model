@@ -6,12 +6,14 @@ from typing import Optional, Tuple
 from .attention import Attention
 from .swiglu import SwiGLU
 from .kv_cache import KVCache, KVCacheList
+from .utils import get_module_class
 
 
 class HyperConnectionBlock(nn.Module):
     def __init__(
-            self,
+            self, *,
             block: nn.Module,
+            norm: str,
             dim: int,
             expansion_rate: int,
             layer_id: int,
@@ -40,13 +42,13 @@ class HyperConnectionBlock(nn.Module):
             self.w_b = nn.Parameter(torch.zeros(dim))
             self.s_b = nn.Parameter(torch.ones(1) * 0.01)
 
-            self.layer_norm = nn.LayerNorm(dim)
+            self.dhc_norm = get_module_class(norm)(dim)
 
     def forward(self, h, **kwargs):
         # h: [B, T, expansion_rate, dim]
 
         if self.dynamic:
-            norm_h = self.layer_norm(h)
+            norm_h = self.dhc_norm(h)
 
             if self.tanh:
                 a = torch.tanh(norm_h @ self.w_a) * self.s_a
@@ -69,14 +71,16 @@ class HyperConnectionBlock(nn.Module):
 
 class AttentionBlock(nn.Module):
     def __init__(
-            self,
-            d_model: int, n_heads: int,
-            dropout: float = 0.1,
-            scale: float = 1.0,
+            self, *,
+            d_model: int,
+            n_heads: int,
+            norm: str,
+            dropout: float,
+            scale: float
     ):
         super().__init__()
 
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = get_module_class(norm)(d_model)
         self.attn = Attention(d_model, n_heads)
         self.dropout = nn.Dropout(dropout)
 
@@ -90,14 +94,15 @@ class AttentionBlock(nn.Module):
 
 class FFNBlock(nn.Module):
     def __init__(
-            self,
+            self, *,
             d_model: int,
-            dropout: float = 0.1,
-            scale: float = 1.0,
+            norm: str,
+            dropout: float,
+            scale: float,
     ):
         super().__init__()
 
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = get_module_class(norm)(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 8),
             SwiGLU(),
@@ -116,15 +121,17 @@ class FFNBlock(nn.Module):
 class HCTransformer(nn.Module):
     def __init__(
             self,
-            n_layers: int, 
-            d_model: int, 
-            n_heads: int, 
+            *,
+            n_layers: int,
+            d_model: int,
+            n_heads: int,
             vocab_size: int,
-            dropout: float = 0.1,
+            norm: str,
+            dropout: float,
             # Hyper-connection params
-            expansion_rate: int=2,
-            dynamic: bool=False,
-            tanh: bool=False
+            expansion_rate: int,
+            dynamic: bool,
+            tanh: bool
     ):
         super().__init__()
 
@@ -149,7 +156,14 @@ class HCTransformer(nn.Module):
         
         self.attn_blocks = nn.ModuleList([
             HyperConnectionBlock(
-                block=AttentionBlock(d_model, n_heads, dropout, scale),
+                block=AttentionBlock(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    norm=norm,
+                    dropout=dropout,
+                    scale=scale
+                ),
+                norm=norm,
                 dim=d_model,
                 expansion_rate=expansion_rate,
                 layer_id=i * 2,
@@ -160,7 +174,13 @@ class HCTransformer(nn.Module):
         ])
         self.ffn_blocks = nn.ModuleList([
             HyperConnectionBlock(
-                block=FFNBlock(d_model, dropout, scale),
+                block=FFNBlock(
+                    d_model=d_model,
+                    norm=norm,
+                    dropout=dropout,
+                    scale=scale
+                ),
+                norm=norm,
                 dim=d_model,
                 expansion_rate=expansion_rate,
                 layer_id=i * 2 + 1,
@@ -170,7 +190,7 @@ class HCTransformer(nn.Module):
             for i in range(n_layers)
         ])
 
-        self.final_ln = nn.LayerNorm(d_model)
+        self.final_norm = get_module_class(norm)(d_model)
 
     def forward(self, x: torch.Tensor, kv_cache: Optional[KVCacheList] = None) -> torch.Tensor:
         x = self.embedding(x)
@@ -180,10 +200,10 @@ class HCTransformer(nn.Module):
             h = self.attn_blocks[i](h, kv_cache=kv_cache[i] if kv_cache else None)
             h = self.ffn_blocks[i](h)
 
-        x = self.final_ln(h.sum(dim=-2, keepdim=False))
+        x = self.final_norm(h.sum(dim=-2, keepdim=False))
         logits = x @ self.embedding.weight.T
         return logits
-    
+
 
     def param_groups(
         self,
