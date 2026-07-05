@@ -1,15 +1,26 @@
 import math
 import torch
 from torch import nn
-from typing import Optional, Tuple
+from typing import Optional
 
-from .attention import Attention
-from .swiglu import SwiGLU
-from .kv_cache import KVCache, KVCacheList
+from .kv_cache import KVCacheList
 from .utils import get_module_class
+from .hc_transformer import AttentionBlock, FFNBlock
 
 
-class HyperConnectionBlock(nn.Module):
+def _logit(x: torch.Tensor) -> torch.Tensor:
+    return torch.log(x / (1.0 - x))
+
+
+def sinkhorn(logits: torch.Tensor, iters: int) -> torch.Tensor:
+    m = torch.exp(logits.float() - logits.float().amax(dim=(-2, -1), keepdim=True))
+    for _ in range(iters):
+        m = m / m.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        m = m / m.sum(dim=-2, keepdim=True).clamp_min(1e-12)
+    return m.to(dtype=logits.dtype)
+
+
+class MHCBlock(nn.Module):
     def __init__(
             self, *,
             block: nn.Module,
@@ -17,108 +28,65 @@ class HyperConnectionBlock(nn.Module):
             dim: int,
             expansion_rate: int,
             layer_id: int,
-            dynamic: bool,
-            tanh: bool
+            sinkhorn_iters: int = 20,
+            gate_init: float = 0.01,
+            init_eps: float = 1e-4,
     ):
         super().__init__()
-        
+
         self.block = block
         self.expansion_rate = expansion_rate
-        self.dynamic = dynamic
-        self.tanh = tanh
+        self.dim = dim
+        self.sinkhorn_iters = sinkhorn_iters
 
-        # B [expansion_rate]
-        self.b = nn.Parameter(torch.ones(expansion_rate))
+        pre = torch.full((expansion_rate,), init_eps)
+        pre[layer_id % expansion_rate] = 1.0 - init_eps
+        post = torch.zeros(expansion_rate)
+        res = torch.eye(expansion_rate)
+        if expansion_rate > 1:
+            res = res * (1.0 - init_eps) + (1.0 - res) * (init_eps / (expansion_rate - 1))
 
-        # A: Am & Ar [expansion_rate, expansion_rate + 1]
-        am = torch.zeros(expansion_rate, 1)
-        am[layer_id % expansion_rate, 0] = 1.0
-        self.a = nn.Parameter(torch.cat([am, torch.eye(expansion_rate)], dim=1))
+        self.pre_bias = nn.Parameter(_logit(pre))
+        self.post_bias = nn.Parameter(post)
+        self.res_bias = nn.Parameter(res.log())
 
-        if dynamic:
-            self.w_a = nn.Parameter(torch.zeros(dim, expansion_rate + 1))
-            self.s_a = nn.Parameter(torch.ones(1) * 0.01)
+        out_dim = expansion_rate * expansion_rate + 2 * expansion_rate
+        self.phi = nn.Parameter(torch.zeros(expansion_rate * dim, out_dim))
+        self.alpha_pre = nn.Parameter(torch.ones(1) * gate_init)
+        self.alpha_post = nn.Parameter(torch.ones(1) * gate_init)
+        self.alpha_res = nn.Parameter(torch.ones(1) * gate_init)
 
-            self.w_b = nn.Parameter(torch.zeros(dim))
-            self.s_b = nn.Parameter(torch.ones(1) * 0.01)
-
-            self.dhc_norm = get_module_class(norm)(dim)
+        self.mhc_norm = get_module_class(norm)(expansion_rate * dim)
 
     def forward(self, h, **kwargs):
         # h: [B, T, expansion_rate, dim]
 
-        if self.dynamic:
-            norm_h = self.dhc_norm(h)
-
-            if self.tanh:
-                a = torch.tanh(norm_h @ self.w_a) * self.s_a
-                b = torch.tanh(norm_h @ self.w_b) * self.s_b
-            else:
-                a = norm_h @ self.w_a * self.s_a
-                b = norm_h @ self.w_b * self.s_b
-
-            a = a + self.a[None, None, :, :]
-            b = b + self.b[None, None, :]
-        else:
-            a = self.a[None, None, :, :]
-            b = self.b[None, None, :]
-
-        h_mix = a.transpose(-1, -2) @ h
-        h_layer = self.block(h_mix[..., 0, :], **kwargs)
-
-        return h_mix[..., 1:, :] + b[..., :, None] * h_layer[..., None, :]
-
-
-class AttentionBlock(nn.Module):
-    def __init__(
-            self, *,
-            d_model: int,
-            n_heads: int,
-            norm: str,
-            dropout: float,
-            scale: float
-    ):
-        super().__init__()
-
-        self.norm = get_module_class(norm)(d_model)
-        self.attn = Attention(d_model, n_heads)
-        self.dropout = nn.Dropout(dropout)
-
-        if scale != 1.0:
-            with torch.no_grad():
-                self.attn.w_o.weight.mul_(scale)
-
-    def forward(self, x: torch.Tensor, kv_cache: Optional[KVCache] = None) -> torch.Tensor:
-        return self.dropout(self.attn(self.norm(x), kv_cache=kv_cache))
-
-
-class FFNBlock(nn.Module):
-    def __init__(
-            self, *,
-            d_model: int,
-            norm: str,
-            dropout: float,
-            scale: float,
-    ):
-        super().__init__()
-
-        self.norm = get_module_class(norm)(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 8),
-            SwiGLU(),
-            nn.Linear(d_model * 4, d_model)
+        h_flat = h.reshape(*h.shape[:-2], self.expansion_rate * self.dim)
+        coeffs = self.mhc_norm(h_flat) @ self.phi
+        raw_pre, raw_post, raw_res = torch.split(
+            coeffs,
+            [self.expansion_rate, self.expansion_rate, self.expansion_rate * self.expansion_rate],
+            dim=-1,
         )
-        self.dropout = nn.Dropout(dropout)
 
-        if scale != 1.0:
-            with torch.no_grad():
-                self.ffn[2].weight.mul_(scale)
+        raw_pre = self.alpha_pre * raw_pre + self.pre_bias
+        raw_post = self.alpha_post * raw_post + self.post_bias
+        raw_res = self.alpha_res * raw_res + self.res_bias.reshape(-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.ffn(self.norm(x)))
+        h_pre = torch.sigmoid(raw_pre)
+        h_post = 2.0 * torch.sigmoid(raw_post)
+        h_res = sinkhorn(
+            raw_res.reshape(*raw_res.shape[:-1], self.expansion_rate, self.expansion_rate),
+            self.sinkhorn_iters,
+        )
+
+        h_layer_in = h_pre[..., None, :] @ h
+        h_layer = self.block(h_layer_in.squeeze(-2), **kwargs)
+
+        return h_res @ h + h_post[..., :, None] * h_layer[..., None, :]
 
 
-class HCTransformer(nn.Module):
+class MHCTransformer(nn.Module):
     def __init__(
             self,
             *,
@@ -130,8 +98,7 @@ class HCTransformer(nn.Module):
             dropout: float,
             # Hyper-connection params
             expansion_rate: int,
-            dynamic: bool,
-            tanh: bool
+            sinkhorn_iters: int = 10,
     ):
         super().__init__()
 
@@ -144,8 +111,7 @@ class HCTransformer(nn.Module):
         self.vocab_size = vocab_size
 
         self.expansion_rate = expansion_rate
-        self.dynamic = dynamic
-        self.tanh = tanh
+        self.sinkhorn_iters = sinkhorn_iters
 
 
         scale = 1.0 / expansion_rate ** 0.5
@@ -153,9 +119,9 @@ class HCTransformer(nn.Module):
         # Layers
         self.embedding = nn.Embedding(vocab_size, d_model)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
-        
+
         self.attn_blocks = nn.ModuleList([
-            HyperConnectionBlock(
+            MHCBlock(
                 block=AttentionBlock(
                     d_model=d_model,
                     n_heads=n_heads,
@@ -167,13 +133,12 @@ class HCTransformer(nn.Module):
                 dim=d_model,
                 expansion_rate=expansion_rate,
                 layer_id=i * 2,
-                dynamic=dynamic,
-                tanh=tanh,
+                sinkhorn_iters=sinkhorn_iters,
             )
             for i in range(n_layers)
         ])
         self.ffn_blocks = nn.ModuleList([
-            HyperConnectionBlock(
+            MHCBlock(
                 block=FFNBlock(
                     d_model=d_model,
                     norm=norm,
@@ -184,8 +149,7 @@ class HCTransformer(nn.Module):
                 dim=d_model,
                 expansion_rate=expansion_rate,
                 layer_id=i * 2 + 1,
-                dynamic=dynamic,
-                tanh=tanh,
+                sinkhorn_iters=sinkhorn_iters,
             )
             for i in range(n_layers)
         ])
@@ -215,9 +179,10 @@ class HCTransformer(nn.Module):
         hc_static_ids = set()
 
         for module in self.modules():
-            if isinstance(module, HyperConnectionBlock):
-                hc_static_ids.add(id(module.a))
-                hc_static_ids.add(id(module.b))
+            if isinstance(module, MHCBlock):
+                hc_static_ids.add(id(module.pre_bias))
+                hc_static_ids.add(id(module.post_bias))
+                hc_static_ids.add(id(module.res_bias))
 
         for name, p in self.named_parameters():
             if not p.requires_grad:

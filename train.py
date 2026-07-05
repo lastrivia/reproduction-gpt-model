@@ -19,6 +19,7 @@ from dict_tools import check_conflict, override_dict
 from preset import load_preset
 from scheduler import build_warmup_cosine_scheduler
 from transformer.hc_transformer import HCTransformer
+from transformer.mhc_transformer import MHCTransformer
 from transformer.transformer import Transformer
 
 
@@ -49,6 +50,15 @@ default_args = {
             "tanh": False,
         },
     },
+    "mhc": {
+        "model_preset": "small",
+        "residual_arch": "mhc",
+        "compatible": False,
+        "arch_params": {
+            "expansion_rate": 2,
+            "sinkhorn_iters": 10,
+        },
+    },
 }
 
 
@@ -66,6 +76,7 @@ def parse_args() -> tuple[str, dict]:
     parser.add_argument("--compatible", action="store_true")  # legacy training implementation
 
     parser.add_argument("--expansion-rate", type=int)
+    parser.add_argument("--sinkhorn-iters", type=int)
     parser.add_argument("--dynamic", action="store_true")
     parser.add_argument("--tanh", action="store_true")
 
@@ -187,6 +198,11 @@ def main():
         model = Transformer(**common_model_kwargs)
     elif run_args["residual_arch"] == "hc":
         model = HCTransformer(
+            **common_model_kwargs,
+            **run_args["arch_params"],
+        )
+    elif run_args["residual_arch"] == "mhc":
+        model = MHCTransformer(
             **common_model_kwargs,
             **run_args["arch_params"],
         )

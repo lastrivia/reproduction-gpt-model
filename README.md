@@ -35,7 +35,7 @@ Common presets:
 
 - `vanilla`: standard decoder-only Transformer residual stream, following Transformer-style residual blocks.
 - `hc`: Hyper-Connections, which expand the residual stream into multiple streams and learn cross-depth feature routing ([Zhu et al., 2024](https://arxiv.org/abs/2409.19606)).
-- `mhc`: *TODO.* Manifold-Constrained Hyper-Connections constrain the HC residual mixing space to improve identity mapping and efficiency ([Xie et al., 2025](https://arxiv.org/abs/2512.24880)).
+- `mhc`: Manifold-Constrained Hyper-Connections constrain the HC residual mixing space to improve identity mapping and efficiency ([Xie et al., 2025](https://arxiv.org/abs/2512.24880)).
 
 Training uses AdamW with warmup, cosine decay, and a final constant learning-rate stage. Perplexity is logged every optimizer step, while console stats and checkpoints report average perplexity over the elapsed time interval since the previous stat/save event.
 

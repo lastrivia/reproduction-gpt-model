@@ -1,7 +1,7 @@
 import math
 import torch
 from torch import nn
-from typing import Optional, Tuple
+from typing import Optional
 
 from .attention import Attention
 from .swiglu import SwiGLU
@@ -21,7 +21,7 @@ class HyperConnectionBlock(nn.Module):
             tanh: bool
     ):
         super().__init__()
-        
+
         self.block = block
         self.expansion_rate = expansion_rate
         self.dynamic = dynamic
@@ -153,7 +153,7 @@ class HCTransformer(nn.Module):
         # Layers
         self.embedding = nn.Embedding(vocab_size, d_model)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
-        
+
         self.attn_blocks = nn.ModuleList([
             HyperConnectionBlock(
                 block=AttentionBlock(
