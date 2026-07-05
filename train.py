@@ -32,8 +32,6 @@ grad_clip_norm = 1.0
 stat_interval_s = 30.0
 save_interval_s = 1800.0
 
-device = torch.device("cuda:0")
-
 default_args = {
     "vanilla": {
         "model_preset": "small",
@@ -62,13 +60,14 @@ default_args = {
 }
 
 
-def parse_args() -> tuple[str, dict]:
+def parse_args() -> tuple[Path, int, dict]:
     parser = argparse.ArgumentParser(
         description="Train a GPT-style model.",
         argument_default=argparse.SUPPRESS,
     )
 
     parser.add_argument("-d", "--save-dir", type=Path, required=True)
+    parser.add_argument("-c", "--cuda", type=int, default=0)
 
     parser.add_argument("-p", "--model-preset")
     parser.add_argument("-a", "--residual-arch")
@@ -82,6 +81,7 @@ def parse_args() -> tuple[str, dict]:
 
     raw_args = parser.parse_args()
     save_dir = raw_args.save_dir
+    cuda_id = raw_args.cuda
     raw_args = vars(raw_args)
 
     args = {
@@ -92,12 +92,12 @@ def parse_args() -> tuple[str, dict]:
     arch_params = {
         name: raw_args[name]
         for name in raw_args
-        if name not in ("save_dir", "model_preset", "residual_arch", "compatible")
+        if name not in ("save_dir", "cuda", "model_preset", "residual_arch", "compatible")
     }
     if arch_params:
         args["arch_params"] = arch_params
 
-    return save_dir, args
+    return save_dir, cuda_id, args
 
 
 def set_seed(seed: int):
@@ -115,7 +115,9 @@ def main():
     # parse args
     # ================================
 
-    save_dir, cli_args = parse_args()
+    save_dir, cuda_id, cli_args = parse_args()
+    device = torch.device(f"cuda:{cuda_id}")
+    print("Device:", device)
 
     checkpoint_meta = load_checkpoint_meta(save_dir)
     meta = checkpoint_meta.meta
