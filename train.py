@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -26,9 +27,9 @@ global_seed = 42
 chinchilla_coeff = 20.0
 weight_decay = 0.01
 dropout = 0.1
-stat_interval = 20
-save_interval = 2000
-save_ma_window = 100
+grad_clip_norm = 1.0
+stat_interval_s = 30.0
+save_interval_s = 1800.0
 
 device = torch.device("cuda:0")
 
@@ -62,7 +63,7 @@ def parse_args() -> tuple[str, dict]:
     parser.add_argument("-p", "--model-preset")
     parser.add_argument("-a", "--residual-arch")
 
-    parser.add_argument("--compatible", action="store_true")  # use sum-reduction for loss
+    parser.add_argument("--compatible", action="store_true")  # legacy training implementation
 
     parser.add_argument("--expansion-rate", type=int)
     parser.add_argument("--dynamic", action="store_true")
@@ -146,6 +147,8 @@ def main():
     tokens_per_step = config["tokens_per_step"]
     max_lr = config["max_lr"]
     min_lr = config["min_lr"]
+    warmup_ratio = config["warmup_ratio"]
+    cosine_ratio = config["cosine_ratio"]
 
     if tokens_per_step % (micro_batch_size * seq_len) != 0:
         raise ValueError(
@@ -201,21 +204,14 @@ def main():
     # automatically resume from the latest checkpoint
     # ================================
 
-    warmup_steps = int(n_steps * 0.01)
-    cosine_steps = int(n_steps * 0.95)
-
-    save_size = total_params * 12
-    save_times = n_steps // save_interval + 1
-    print(f"Size of checkpoints: {save_size * save_times:,}")
-
     def build_optimizer(model) -> Optimizer:
         return AdamW(model.param_groups(weight_decay=weight_decay), lr=max_lr)
 
     def build_scheduler(optimizer):
         return build_warmup_cosine_scheduler(
             optimizer,
-            warmup_steps=warmup_steps,
-            cosine_steps=cosine_steps,
+            warmup_steps=int(n_steps * warmup_ratio),
+            cosine_steps=int(n_steps * cosine_ratio),
             max_lr=max_lr,
             min_lr=min_lr,
         )
@@ -267,15 +263,16 @@ def main():
     # run training
     # ================================
 
-    def moving_average_loss_and_perplexity(rows: list[dict], window: int):
-        recent_rows = rows[-window:]
-        if not recent_rows:
+    def average_loss_and_perplexity(start_step: int, end_step: int):
+        count = end_step - start_step + 1
+        if count <= 0:
             return None, None, 0
-        ma_loss = sum(row["loss"] for row in recent_rows) / len(recent_rows)
-        return ma_loss, math.exp(ma_loss), len(recent_rows)
+        rows = log_rows[start_step:end_step + 1]
+        avg_loss = sum(row["loss"] for row in rows) / count
+        return avg_loss, math.exp(avg_loss), count
 
-    def save(finished: bool, step: int):
-        ma_loss, ma_perplexity, ma_count = moving_average_loss_and_perplexity(log_rows, save_ma_window)
+    def save(finished: bool, step: int, avg_start_step: int):
+        avg_loss, avg_perplexity, avg_count = average_loss_and_perplexity(avg_start_step, step)
         meta = run_args | {
             "n_layers": model.n_layers,
             "d_model": model.d_model,
@@ -288,14 +285,18 @@ def main():
             "grad_accum_steps": grad_accum_steps,
             "max_lr": max_lr,
             "min_lr": min_lr,
+            "warmup_ratio": warmup_ratio,
+            "cosine_ratio": cosine_ratio,
             "weight_decay": weight_decay,
+            "grad_clip_norm": None if run_args["compatible"] else grad_clip_norm,
             "dataset": dataset_name,
             "n_steps": n_steps,
             "training_tokens": actual_training_tokens,
-            "ma_window": save_ma_window,
-            "ma_count": ma_count,
-            "ma_loss": ma_loss,
-            "ma_perplexity": ma_perplexity,
+            "stat_interval_s": stat_interval_s,
+            "save_interval_s": save_interval_s,
+            "avg_count": avg_count,
+            "avg_loss": avg_loss,
+            "avg_perplexity": avg_perplexity,
             "finished": finished,
             "step": step,
         }
@@ -308,9 +309,9 @@ def main():
             scheduler=None if finished else scheduler,
             finished=finished,
         )
-        ma_label = f"{ma_perplexity:.2f}" if ma_perplexity is not None else "n/a"
+        avg_label = f"{avg_perplexity:.2f}" if avg_perplexity is not None else "n/a"
         checkpoint_label = "Final checkpoint" if finished else "Checkpoint"
-        print(f"{checkpoint_label} saved; MA{ma_count} perplexity: {ma_label}")
+        print(f"{checkpoint_label} saved; Avg perplexity: {avg_label} ({avg_count} steps)")
 
     model.train()
     optimizer.zero_grad()
@@ -324,6 +325,11 @@ def main():
         ncols=80,
     )
     data_iter = iter(loader)
+
+    last_stat_time = time.monotonic()
+    last_save_time = last_stat_time
+    last_stat_step = start_step - 1
+    last_save_step = start_step - 1
 
     for step in range(start_step, n_steps):
         step_loss = 0.0
@@ -347,6 +353,9 @@ def main():
                 micro_loss /= targets.numel()
             step_loss += micro_loss / grad_accum_steps
 
+        if not run_args["compatible"]:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
@@ -361,19 +370,24 @@ def main():
             "lr": lr,
         })
 
-        if (step + 1) % stat_interval == 0:
-            _, stat_ma_perplexity, stat_ma_count = moving_average_loss_and_perplexity(log_rows, stat_interval)
-            ma_label = f"{stat_ma_perplexity:.2f}" if stat_ma_perplexity is not None else "n/a"
-            print(f"Learning rate: {lr:.6f}, MA{stat_ma_count} perplexity: {ma_label}")
+        now = time.monotonic()
+        if now - last_stat_time >= stat_interval_s:
+            _, stat_avg_perplexity, stat_avg_count = average_loss_and_perplexity(last_stat_step + 1, step)
+            avg_label = f"{stat_avg_perplexity:.2f}" if stat_avg_perplexity is not None else "n/a"
+            print(f"Learning rate: {lr:.6f}, Avg perplexity: {avg_label} ({stat_avg_count} steps)")
+            last_stat_time = now
+            last_stat_step = step
 
-        if (step + 1) % save_interval == 0:
-            save(finished=False, step=step)
+            if now - last_save_time >= save_interval_s:
+                save(finished=False, step=step, avg_start_step=last_save_step + 1)
+                last_save_time = time.monotonic()
+                last_save_step = step
 
         pbar.update(1)
 
     pbar.close()
 
-    save(finished=True, step=n_steps - 1)
+    save(finished=True, step=n_steps - 1, avg_start_step=last_save_step + 1)
 
 
 if __name__ == "__main__":

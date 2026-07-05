@@ -9,6 +9,8 @@ smallest-classic:
   tokens_per_step: 8192
   max_lr: 5.0e-4
   min_lr: 5.0e-5
+  warmup_ratio: 0.01
+  cosine_ratio: 0.95
 
 small-classic:
   n_layers: 12
@@ -21,6 +23,8 @@ small-classic:
   tokens_per_step: 4096
   max_lr: 2.0e-4
   min_lr: 2.0e-5
+  warmup_ratio: 0.01
+  cosine_ratio: 0.95
 
 medium-classic:
   n_layers: 24
@@ -33,6 +37,8 @@ medium-classic:
   tokens_per_step: 2048
   max_lr: 1.0e-4
   min_lr: 1.0e-5
+  warmup_ratio: 0.01
+  cosine_ratio: 0.95
 
 small:
   derived: small-classic
@@ -42,6 +48,7 @@ small:
   tokens_per_step: 32768
   max_lr: 5.0e-4
   min_lr: 5.0e-5
+  warmup_ratio: 0.02
 
 small-server:
   derived: small
@@ -55,6 +62,7 @@ medium:
   tokens_per_step: 65536
   max_lr: 3.0e-4
   min_lr: 3.0e-5
+  warmup_ratio: 0.02
 
 medium-server:
   derived: medium

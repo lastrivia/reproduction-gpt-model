@@ -15,6 +15,7 @@ from plot import plot_training_curve
 
 
 LOG_FIELDS = ("step", "loss", "ppl", "lr")
+CURVE_WINDOW_TOKENS = 4194304
 
 def save_checkpoint(
         *,
@@ -64,11 +65,15 @@ def save_checkpoint(
         for row in log_rows:
             writer.writerow({field: row[field] for field in LOG_FIELDS})
 
+    curve_window = CURVE_WINDOW_TOKENS // meta["tokens_per_step"]
+    if curve_window < 8:
+        curve_window = 8
+
     plot_training_curve(
         step=[row["step"] for row in log_rows],
-        ppl=[row["ppl"] for row in log_rows], 
-        show=False, 
-        save=str(tmp_dir / "curve.png")
+        log_ppl=[row["loss"] for row in log_rows],
+        window=curve_window,
+        save=tmp_dir / "curve.png"
     )
 
     torch.save(model.state_dict(), tmp_dir / "model.pt")

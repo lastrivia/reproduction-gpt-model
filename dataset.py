@@ -1,3 +1,4 @@
+import argparse
 import bisect
 from pathlib import Path
 from typing import Optional
@@ -63,6 +64,23 @@ class TokenizedBatchDataset(IterableDataset):
 
         self.total_seq = self.seq_prefix[-1]
         self.total_batches = self.total_seq // self.batch_size
+
+        if self.start_batch_idx > self.total_batches:
+            raise ValueError(
+                f"start_batch_idx exceeds available batches: "
+                f"{self.start_batch_idx} > {self.total_batches}"
+            )
+        if (
+                self.max_batches is not None
+                and self.start_batch_idx + self.max_batches > self.total_batches
+        ):
+            raise ValueError(
+                f"requested batches exceed available batches: "
+                f"start_batch_idx={self.start_batch_idx}, "
+                f"max_batches={self.max_batches}, "
+                f"total_batches={self.total_batches}"
+            )
+
         self._cache_file = None
         self._cache_buf = None
         self._cache_tokens = None
@@ -141,3 +159,36 @@ class TokenizedBatchDataset(IterableDataset):
 
         for batch_idx in range(self.start_batch_idx, self.start_batch_idx + len(self)):
             yield self._read_batch(batch_idx)
+
+
+def main():
+    # check dataset content
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seq-len", required=True, type=int)
+    parser.add_argument("--start-batch-idx", required=True, type=int)
+    parser.add_argument("--max-batches", required=True, type=int)
+    args = parser.parse_args()
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        "allenai/gpt-neox-olmo-dolma-v1_5",
+        use_fast=True,
+    )
+    dataset = TokenizedBatchDataset(
+        dataset="fineweb-edu",
+        seq_len=args.seq_len,
+        batch_size=1,
+        start_batch_idx=args.start_batch_idx,
+        max_batches=args.max_batches,
+    )
+
+    for batch_offset, batch in enumerate(dataset):
+        batch_idx = args.start_batch_idx + batch_offset
+        for row_idx, tokens in enumerate(batch):
+            print(f"===== batch {batch_idx}, row {row_idx} =====")
+            print(tokenizer.decode(tokens.tolist(), clean_up_tokenization_spaces=False))
+
+
+if __name__ == "__main__":
+    main()
