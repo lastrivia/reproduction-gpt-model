@@ -177,9 +177,14 @@ def main():
     # prepare tokenizer
     # ================================
 
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #     "allenai/gpt-neox-olmo-dolma-v1_5",
+    #     use_fast=True,
+    # )
     tokenizer = AutoTokenizer.from_pretrained(
-        "allenai/gpt-neox-olmo-dolma-v1_5",
+        "./tokenizer/tokenizer",
         use_fast=True,
+        local_files_only=True
     )
     vocab_size = len(tokenizer)
     print("Vocab size:", vocab_size)

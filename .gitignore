@@ -2,7 +2,6 @@ data/*/*/
 data/*/*.json
 
 results/
-tokenizer/tokenizer/
 
 .idea/
 .agents/
