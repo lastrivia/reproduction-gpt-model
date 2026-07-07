@@ -2,6 +2,7 @@ data/*/*/
 data/*/*.json
 
 results/
+temp/
 
 .idea/
 .agents/

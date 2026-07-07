@@ -1,4 +1,5 @@
 import csv
+from datetime import datetime
 import json
 import shutil
 import warnings
@@ -26,6 +27,8 @@ def save_checkpoint(
         optimizer: Optimizer | None = None,
         scheduler: LRScheduler | None = None,
         finished: bool = False,
+        error: bool = False,
+        diagnosis: dict | None = None,
         max_backup: int = 2,
 ):
     """
@@ -59,6 +62,10 @@ def save_checkpoint(
     with open(tmp_dir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=4)
 
+    if error:
+        with open(tmp_dir / "diagnosis.json", "w", encoding="utf-8") as f:
+            json.dump(diagnosis, f, indent=4)
+
     with open(tmp_dir / "log.csv", "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
         writer.writeheader()
@@ -86,11 +93,25 @@ def save_checkpoint(
     # publish checkpoint
     # ================================
 
-    _rotate_backups(save_dir=save_dir, max_backup=max_backup)
-    target = save_dir / ("finished" if finished else "latest")
+    if error:
+        target = _error_checkpoint_dir(save_dir)
+    else:
+        _rotate_backups(save_dir=save_dir, max_backup=max_backup)
+        target = save_dir / ("finished" if finished else "latest")
+
     if target.exists():
         shutil.rmtree(target)
     shutil.move(str(tmp_dir), str(target))
+
+
+def _error_checkpoint_dir(save_dir: Path) -> Path:
+    stem = f"error-{datetime.now().strftime('%m%d%H%M')}"
+    target = save_dir / stem
+    suffix = 1
+    while target.exists():
+        target = save_dir / f"{stem}-{suffix}"
+        suffix += 1
+    return target
 
 
 def _rotate_backups(*, save_dir: Path, max_backup: int):

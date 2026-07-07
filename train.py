@@ -15,6 +15,7 @@ from transformers import AutoTokenizer
 
 from checkpoint import CheckpointState, init_checkpoint, load_checkpoint_meta, save_checkpoint
 from dataset import TokenizedBatchDataset
+from diagnosis import diagnose_loss, diagnose_parameters
 from dict_tools import check_conflict, override_dict
 from preset import load_preset
 from scheduler import build_warmup_cosine_scheduler
@@ -122,7 +123,7 @@ def main():
     checkpoint_meta = load_checkpoint_meta(save_dir)
     meta = checkpoint_meta.meta
 
-    if meta is None:
+    if meta is None:  # Launch new training
         if "residual_arch" not in cli_args:
             raise ValueError("-a is required when starting without checkpoint")
         residual_arch = cli_args["residual_arch"]
@@ -130,7 +131,7 @@ def main():
             raise ValueError(f"unknown arch: {residual_arch}")
         run_args = override_dict(cli_args, default_args[residual_arch])
 
-    else:
+    else:  # Resume training
         checkpoint_args = {
             "model_preset": meta["model_preset"],
             "residual_arch": meta["residual_arch"],
@@ -294,7 +295,13 @@ def main():
         avg_loss = sum(row["loss"] for row in rows) / count
         return avg_loss, math.exp(avg_loss), count
 
-    def save(finished: bool, step: int, avg_start_step: int):
+    def save(
+            finished: bool,
+            step: int,
+            avg_start_step: int,
+            error: bool = False,
+            diagnosis: dict | None = None,
+    ):
         avg_loss, avg_perplexity, avg_count = average_loss_and_perplexity(avg_start_step, step)
         meta = run_args | {
             "n_layers": model.n_layers,
@@ -331,9 +338,11 @@ def main():
             optimizer=None if finished else optimizer,
             scheduler=None if finished else scheduler,
             finished=finished,
+            error=error,
+            diagnosis=diagnosis,
         )
         avg_label = f"{avg_perplexity:.2f}" if avg_perplexity is not None else "n/a"
-        checkpoint_label = "Final checkpoint" if finished else "Checkpoint"
+        checkpoint_label = "Error checkpoint" if error else ("Final checkpoint" if finished else "Checkpoint")
         print(f"{checkpoint_label} saved; Avg perplexity: {avg_label} ({avg_count} steps)")
 
     model.train()
@@ -354,63 +363,96 @@ def main():
     last_stat_step = start_step - 1
     last_save_step = start_step - 1
 
-    for step in range(start_step, n_steps):
-        step_loss = 0.0
+    err_info = None
+    try:
+        for step in range(start_step, n_steps):
+            step_loss = 0.0
 
-        for _ in range(grad_accum_steps):
-            batch = next(data_iter).to(device)
-            inputs = batch[:, :-1]
-            targets = batch[:, 1:]
+            for microbatch in range(grad_accum_steps):
+                batch = next(data_iter).to(device)
+                inputs = batch[:, :-1]
+                targets = batch[:, 1:]
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(inputs)
-                loss = cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    targets.reshape(-1),
-                    reduction="sum" if run_args["compatible"] else "mean",
-                )
-                (loss / grad_accum_steps).backward()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model(inputs)
+                    loss = cross_entropy(
+                        logits.reshape(-1, logits.shape[-1]),
+                        targets.reshape(-1),
+                        reduction="sum" if run_args["compatible"] else "mean",
+                    )
 
-            micro_loss = loss.item()
-            if run_args["compatible"]:
-                micro_loss /= targets.numel()
-            step_loss += micro_loss / grad_accum_steps
+                    if not torch.isfinite(loss).item():
+                        loss_items = cross_entropy(
+                            logits.reshape(-1, logits.shape[-1]),
+                            targets.reshape(-1),
+                            reduction="none",
+                        ).view_as(targets)
+                        err_info = {
+                            "step": step,
+                            "microbatch": microbatch,
+                            "diagnosis": {
+                                "loss": diagnose_loss(loss_items),
+                                "model": diagnose_parameters(model),
+                            },
+                        }
+                        raise FloatingPointError("bad loss detected")
 
-        if not run_args["compatible"]:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    (loss / grad_accum_steps).backward()
 
-        optimizer.step()
-        scheduler.step()
+                micro_loss = loss.item()
+                if run_args["compatible"]:
+                    micro_loss /= targets.numel()
+                step_loss += micro_loss / grad_accum_steps
+
+            if not run_args["compatible"]:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            ppl = math.exp(step_loss)
+            lr = optimizer.param_groups[0]["lr"]
+
+            log_rows.append({
+                "step": step,
+                "loss": step_loss,
+                "ppl": ppl,
+                "lr": lr,
+            })
+
+            now = time.monotonic()
+            if now - last_stat_time >= stat_interval_s:
+                _, stat_avg_perplexity, stat_avg_count = average_loss_and_perplexity(last_stat_step + 1, step)
+                avg_label = f"{stat_avg_perplexity:.2f}" if stat_avg_perplexity is not None else "n/a"
+                print(f"Learning rate: {lr:.6f}, Avg perplexity: {avg_label} ({stat_avg_count} steps)")
+                last_stat_time = now
+                last_stat_step = step
+
+                if now - last_save_time >= save_interval_s:
+                    save(finished=False, step=step, avg_start_step=last_save_step + 1)
+                    last_save_time = time.monotonic()
+                    last_save_step = step
+
+            pbar.update(1)
+
+        pbar.close()
+
+        save(finished=True, step=n_steps - 1, avg_start_step=last_save_step + 1)
+
+    except FloatingPointError as exc:
         optimizer.zero_grad()
-
-        ppl = math.exp(step_loss)
-        lr = optimizer.param_groups[0]["lr"]
-
-        log_rows.append({
-            "step": step,
-            "loss": step_loss,
-            "ppl": ppl,
-            "lr": lr,
-        })
-
-        now = time.monotonic()
-        if now - last_stat_time >= stat_interval_s:
-            _, stat_avg_perplexity, stat_avg_count = average_loss_and_perplexity(last_stat_step + 1, step)
-            avg_label = f"{stat_avg_perplexity:.2f}" if stat_avg_perplexity is not None else "n/a"
-            print(f"Learning rate: {lr:.6f}, Avg perplexity: {avg_label} ({stat_avg_count} steps)")
-            last_stat_time = now
-            last_stat_step = step
-
-            if now - last_save_time >= save_interval_s:
-                save(finished=False, step=step, avg_start_step=last_save_step + 1)
-                last_save_time = time.monotonic()
-                last_save_step = step
-
-        pbar.update(1)
-
-    pbar.close()
-
-    save(finished=True, step=n_steps - 1, avg_start_step=last_save_step + 1)
+        if err_info is None:
+            err_info = {
+                "exception": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }
+        error_step = log_rows[-1]["step"] if log_rows else start_step - 1
+        save(finished=False, step=error_step, avg_start_step=last_save_step + 1, error=True, diagnosis=err_info)
+        pbar.close()
+        raise
 
 
 if __name__ == "__main__":
