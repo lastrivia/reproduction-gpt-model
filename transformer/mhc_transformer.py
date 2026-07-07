@@ -28,6 +28,7 @@ class MHCBlock(nn.Module):
             dim: int,
             expansion_rate: int,
             layer_id: int,
+            scale_norm: bool,
             sinkhorn_iters: int = 20,
             gate_init: float = 0.01,
             init_eps: float = 1e-4,
@@ -38,6 +39,7 @@ class MHCBlock(nn.Module):
         self.expansion_rate = expansion_rate
         self.dim = dim
         self.sinkhorn_iters = sinkhorn_iters
+        self.scale_norm = scale_norm
 
         pre = torch.full((expansion_rate,), init_eps)
         pre[layer_id % expansion_rate] = 1.0 - init_eps
@@ -57,14 +59,19 @@ class MHCBlock(nn.Module):
         self.alpha_res = nn.Parameter(torch.ones(1) * gate_init)
 
         self.mhc_norm = get_module_class(norm)(expansion_rate * dim)
+        self.norm_scale = (expansion_rate * dim) ** -0.5
 
     def forward(self, h, **kwargs):
         # h: [B, T, expansion_rate, dim]
 
         h_flat = h.reshape(*h.shape[:-2], self.expansion_rate * self.dim)
-        coeffs = self.mhc_norm(h_flat) @ self.phi
+        if self.scale_norm:
+            raw_coeffs = self.mhc_norm(h_flat) @ self.phi * self.norm_scale
+        else:
+            raw_coeffs = self.mhc_norm(h_flat) @ self.phi
+
         raw_pre, raw_post, raw_res = torch.split(
-            coeffs,
+            raw_coeffs,
             [self.expansion_rate, self.expansion_rate, self.expansion_rate * self.expansion_rate],
             dim=-1,
         )
@@ -99,6 +106,7 @@ class MHCTransformer(nn.Module):
             # Hyper-connection params
             expansion_rate: int,
             sinkhorn_iters: int = 10,
+            scale_norm: bool,
     ):
         super().__init__()
 
@@ -133,6 +141,7 @@ class MHCTransformer(nn.Module):
                 dim=d_model,
                 expansion_rate=expansion_rate,
                 layer_id=i * 2,
+                scale_norm=scale_norm,
                 sinkhorn_iters=sinkhorn_iters,
             )
             for i in range(n_layers)
@@ -149,6 +158,7 @@ class MHCTransformer(nn.Module):
                 dim=d_model,
                 expansion_rate=expansion_rate,
                 layer_id=i * 2 + 1,
+                scale_norm=scale_norm,
                 sinkhorn_iters=sinkhorn_iters,
             )
             for i in range(n_layers)

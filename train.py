@@ -213,6 +213,7 @@ def main():
         model = MHCTransformer(
             **common_model_kwargs,
             **run_args["arch_params"],
+            scale_norm=True,
         )
     else:
         raise NotImplementedError(f"unknown residual_arch: {run_args['residual_arch']}")
