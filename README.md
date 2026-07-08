@@ -27,9 +27,9 @@ Common presets:
 | `small-classic` | 12 | 768 | 12 | LayerNorm | 512 | 8 | 4,096 | 8 GiB |
 | `medium-classic` | 24 | 1024 | 16 | LayerNorm | 512 | 4 | 2,048 | 11 GiB |
 | `small` | 12 | 768 | 12 | RMSNorm | 2048 | 2 | 32,768 | 9 GiB |
-| `small-server` | 12 | 768 | 12 | RMSNorm | 2048 | 16 | 32,768 | |
+| `small-server` | 12 | 768 | 12 | RMSNorm | 2048 | 4 | 32,768 | |
 | `medium` | 24 | 1024 | 16 | RMSNorm | 2048 | 1 | 65,536 | 13 GiB |
-| `medium-server` | 24 | 1024 | 16 | RMSNorm | 2048 | 8 | 65,536 | |
+| `medium-server` | 24 | 1024 | 16 | RMSNorm | 2048 | 2 | 65,536 | |
 
 `residual_arch` selects the residual-stream architecture:
 

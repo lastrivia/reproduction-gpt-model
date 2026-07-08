@@ -52,7 +52,7 @@ small:
 
 small-server:
   derived: small
-  micro_batch_size: 16
+  micro_batch_size: 4
 
 medium:
   derived: medium-classic
@@ -66,4 +66,4 @@ medium:
 
 medium-server:
   derived: medium
-  micro_batch_size: 8
+  micro_batch_size: 2
