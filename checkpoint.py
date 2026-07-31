@@ -12,7 +12,7 @@ from torch import nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
-from plot import plot_training_curve
+from utils.plot import plot_training_curve
 
 
 LOG_FIELDS = ("step", "loss", "ppl", "lr")

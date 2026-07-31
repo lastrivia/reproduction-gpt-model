@@ -15,8 +15,8 @@ from transformers import AutoTokenizer
 
 from checkpoint import CheckpointState, init_checkpoint, load_checkpoint_meta, save_checkpoint
 from dataset import TokenizedBatchDataset
-from diagnosis import diagnose_loss, diagnose_parameters
-from dict_tools import check_conflict, override_dict
+from utils.fp_diagnosis import diagnose_loss, diagnose_parameters
+from utils.dict_tools import check_conflict, override_dict
 from preset import load_preset
 from scheduler import build_warmup_cosine_scheduler
 from transformer.hc_transformer import HCTransformer
