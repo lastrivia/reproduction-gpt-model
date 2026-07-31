@@ -58,7 +58,7 @@ default_args = {
 }
 
 
-def parse_args() -> tuple[Path, int, dict]:
+def parse_args() -> tuple[Path, int, int | None, dict]:
     parser = argparse.ArgumentParser(
         description="Train a GPT-style model.",
         argument_default=argparse.SUPPRESS,
@@ -66,6 +66,7 @@ def parse_args() -> tuple[Path, int, dict]:
 
     parser.add_argument("-d", "--save-dir", type=Path, required=True)
     parser.add_argument("-c", "--cuda", type=int, default=0)
+    parser.add_argument("-b", "--micro-batch-size", type=int)
 
     parser.add_argument("-p", "--model-preset")
     parser.add_argument("-a", "--residual-arch")
@@ -78,6 +79,7 @@ def parse_args() -> tuple[Path, int, dict]:
     raw_args = parser.parse_args()
     save_dir = raw_args.save_dir
     cuda_id = raw_args.cuda
+    micro_batch_size = getattr(raw_args, "micro_batch_size", None)
     raw_args = vars(raw_args)
 
     args = {
@@ -88,12 +90,12 @@ def parse_args() -> tuple[Path, int, dict]:
     arch_params = {
         name: raw_args[name]
         for name in raw_args
-        if name not in ("save_dir", "cuda", "model_preset", "residual_arch")
+        if name in ("expansion_rate", "sinkhorn_iters", "dynamic", "tanh")
     }
     if arch_params:
         args["arch_params"] = arch_params
 
-    return save_dir, cuda_id, args
+    return save_dir, cuda_id, micro_batch_size, args
 
 
 def set_seed(seed: int):
@@ -111,7 +113,7 @@ def main():
     # parse args
     # ================================
 
-    save_dir, cuda_id, cli_args = parse_args()
+    save_dir, cuda_id, cli_micro_batch_size, cli_args = parse_args()
     device = torch.device(f"cuda:{cuda_id}")
     print("Device:", device)
 
@@ -150,7 +152,6 @@ def main():
     n_heads = config["n_heads"]
     norm = config["norm"]
     vanilla_params = config["vanilla_params"]
-    micro_batch_size = config["micro_batch_size"]
     seq_len = config["seq_len"]
     tokens_per_step = config["tokens_per_step"]
     max_lr = config["max_lr"]
@@ -158,10 +159,17 @@ def main():
     warmup_ratio = config["warmup_ratio"]
     cosine_ratio = config["cosine_ratio"]
 
+    micro_batch_size = (
+        cli_micro_batch_size
+        if cli_micro_batch_size is not None
+        else config["default_micro_batch_size"]
+    )
+    if micro_batch_size <= 0:
+        raise ValueError("micro_batch_size must be positive")
     if tokens_per_step % (micro_batch_size * seq_len) != 0:
         raise ValueError(
-            "invalid preset: tokens_per_step must be divisible by "
-            "micro_batch_size * seq_len"
+            "tokens_per_step must be divisible by micro_batch_size * seq_len: "
+            f"{tokens_per_step} % ({micro_batch_size} * {seq_len}) != 0"
         )
     grad_accum_steps = tokens_per_step // (micro_batch_size * seq_len)
     training_tokens = int(vanilla_params * chinchilla_coeff)
@@ -216,6 +224,7 @@ def main():
     print(f"Params: {total_params:,}")
     print(f"Training steps: {n_steps:,}")
     print(f"Training tokens: {training_tokens:,} (target), {actual_training_tokens:,} (actual)")
+    print(f"Micro batch size: {micro_batch_size}")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
 
     # ================================
@@ -305,9 +314,7 @@ def main():
             "norm": norm,
             "seq_len": seq_len,
             "seed": global_seed,
-            "micro_batch_size": micro_batch_size,
             "tokens_per_step": tokens_per_step,
-            "grad_accum_steps": grad_accum_steps,
             "max_lr": max_lr,
             "min_lr": min_lr,
             "warmup_ratio": warmup_ratio,
