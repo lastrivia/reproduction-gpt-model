@@ -58,15 +58,32 @@ default_args = {
 }
 
 
-def parse_args() -> tuple[Path, int, int | None, dict]:
+def parse_args() -> tuple[Path, int, str, int | None, dict]:
     parser = argparse.ArgumentParser(
         description="Train a GPT-style model.",
         argument_default=argparse.SUPPRESS,
     )
 
-    parser.add_argument("-d", "--save-dir", type=Path, required=True)
-    parser.add_argument("-c", "--cuda", type=int, default=0)
+    parser.add_argument("save_dir", type=Path)
+    parser.add_argument("-i", "--device-index", type=int, default=0)
     parser.add_argument("-b", "--micro-batch-size", type=int)
+
+    accelerator_group = parser.add_mutually_exclusive_group()
+    accelerator_group.add_argument(
+        "--cuda",
+        "--nvidia",
+        dest="accelerator",
+        action="store_const",
+        const="cuda",
+    )
+    accelerator_group.add_argument(
+        "--ascend",
+        "--huawei",
+        dest="accelerator",
+        action="store_const",
+        const="ascend",
+    )
+    parser.set_defaults(accelerator="cuda")
 
     parser.add_argument("-p", "--model-preset")
     parser.add_argument("-a", "--residual-arch")
@@ -78,7 +95,8 @@ def parse_args() -> tuple[Path, int, int | None, dict]:
 
     raw_args = parser.parse_args()
     save_dir = raw_args.save_dir
-    cuda_id = raw_args.cuda
+    device_index = raw_args.device_index
+    accelerator_name = raw_args.accelerator
     micro_batch_size = getattr(raw_args, "micro_batch_size", None)
     raw_args = vars(raw_args)
 
@@ -95,26 +113,31 @@ def parse_args() -> tuple[Path, int, int | None, dict]:
     if arch_params:
         args["arch_params"] = arch_params
 
-    return save_dir, cuda_id, micro_batch_size, args
+    return save_dir, device_index, accelerator_name, micro_batch_size, args
 
 
-def set_seed(seed: int):
+def set_seed(seed: int, accelerator):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    accelerator.manual_seed(seed)
 
 
 def main():
-    set_seed(global_seed)
-
     # ================================
     # parse args
     # ================================
 
-    save_dir, cuda_id, cli_micro_batch_size, cli_args = parse_args()
-    device = torch.device(f"cuda:{cuda_id}")
+    save_dir, device_index, accelerator_name, cli_micro_batch_size, cli_args = parse_args()
+
+    if accelerator_name == "ascend":
+        from accelerator.ascend import Accelerator
+    else:
+        from accelerator.cuda import Accelerator
+
+    accelerator = Accelerator(device_index)
+    set_seed(global_seed, accelerator)
+    device = accelerator.name()
     print("Device:", device)
 
     checkpoint_meta = load_checkpoint_meta(save_dir)
@@ -375,7 +398,7 @@ def main():
                 inputs = batch[:, :-1]
                 targets = batch[:, 1:]
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with accelerator.autocast(dtype=torch.bfloat16):
                     logits = model(inputs)
                     loss = cross_entropy(
                         logits.reshape(-1, logits.shape[-1]),

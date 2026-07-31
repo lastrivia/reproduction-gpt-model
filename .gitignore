@@ -6,4 +6,5 @@ temp/
 
 .idea/
 .agents/
+.remote/
 **/__pycache__/
