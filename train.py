@@ -37,12 +37,10 @@ default_args = {
     "vanilla": {
         "model_preset": "small",
         "residual_arch": "vanilla",
-        "compatible": False,
     },
     "hc": {
         "model_preset": "small",
         "residual_arch": "hc",
-        "compatible": False,
         "arch_params": {
             "expansion_rate": 2,
             "dynamic": False,
@@ -52,7 +50,6 @@ default_args = {
     "mhc": {
         "model_preset": "small",
         "residual_arch": "mhc",
-        "compatible": False,
         "arch_params": {
             "expansion_rate": 2,
             "sinkhorn_iters": 10,
@@ -73,8 +70,6 @@ def parse_args() -> tuple[Path, int, dict]:
     parser.add_argument("-p", "--model-preset")
     parser.add_argument("-a", "--residual-arch")
 
-    parser.add_argument("--compatible", action="store_true")  # legacy training implementation
-
     parser.add_argument("--expansion-rate", type=int)
     parser.add_argument("--sinkhorn-iters", type=int)
     parser.add_argument("--dynamic", action="store_true")
@@ -88,12 +83,12 @@ def parse_args() -> tuple[Path, int, dict]:
     args = {
         name: raw_args[name]
         for name in raw_args
-        if name in ("model_preset", "residual_arch", "compatible")
+        if name in ("model_preset", "residual_arch")
     }
     arch_params = {
         name: raw_args[name]
         for name in raw_args
-        if name not in ("save_dir", "cuda", "model_preset", "residual_arch", "compatible")
+        if name not in ("save_dir", "cuda", "model_preset", "residual_arch")
     }
     if arch_params:
         args["arch_params"] = arch_params
@@ -135,7 +130,6 @@ def main():
         checkpoint_args = {
             "model_preset": meta["model_preset"],
             "residual_arch": meta["residual_arch"],
-            "compatible": meta["compatible"],
         }
         if "arch_params" in default_args[checkpoint_args["residual_arch"]]:
             checkpoint_args["arch_params"] = meta["arch_params"]
@@ -319,7 +313,7 @@ def main():
             "warmup_ratio": warmup_ratio,
             "cosine_ratio": cosine_ratio,
             "weight_decay": weight_decay,
-            "grad_clip_norm": None if run_args["compatible"] else grad_clip_norm,
+            "grad_clip_norm": grad_clip_norm,
             "dataset": dataset_name,
             "n_steps": n_steps,
             "training_tokens": actual_training_tokens,
@@ -379,7 +373,7 @@ def main():
                     loss = cross_entropy(
                         logits.reshape(-1, logits.shape[-1]),
                         targets.reshape(-1),
-                        reduction="sum" if run_args["compatible"] else "mean",
+                        reduction="mean",
                     )
 
                     if not torch.isfinite(loss).item():
@@ -401,12 +395,9 @@ def main():
                     (loss / grad_accum_steps).backward()
 
                 micro_loss = loss.item()
-                if run_args["compatible"]:
-                    micro_loss /= targets.numel()
                 step_loss += micro_loss / grad_accum_steps
 
-            if not run_args["compatible"]:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 
             optimizer.step()
             scheduler.step()
