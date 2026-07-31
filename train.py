@@ -31,7 +31,9 @@ weight_decay = 0.01
 dropout = 0.1
 grad_clip_norm = 1.0
 stat_interval_s = 30.0
-save_interval_s = 1800.0
+save_interval_s = 1200.0
+use_compile = True
+check_fp_error = False
 
 default_args = {
     "vanilla": {
@@ -371,6 +373,7 @@ def main():
         print(f"{checkpoint_label} saved; Avg perplexity: {avg_label} ({avg_count} steps)")
 
     model.train()
+    train_model = torch.compile(model) if use_compile else model
     optimizer.zero_grad()
 
     log_rows = state.log_rows
@@ -399,28 +402,29 @@ def main():
                 targets = batch[:, 1:]
 
                 with accelerator.autocast(dtype=torch.bfloat16):
-                    logits = model(inputs)
+                    logits = train_model(inputs)
                     loss = cross_entropy(
                         logits.reshape(-1, logits.shape[-1]),
                         targets.reshape(-1),
                         reduction="mean",
                     )
 
-                    if not torch.isfinite(loss).item():
-                        loss_items = cross_entropy(
-                            logits.reshape(-1, logits.shape[-1]),
-                            targets.reshape(-1),
-                            reduction="none",
-                        ).view_as(targets)
-                        err_info = {
-                            "step": step,
-                            "microbatch": microbatch,
-                            "diagnosis": {
-                                "loss": diagnose_loss(loss_items),
-                                "model": diagnose_parameters(model),
-                            },
-                        }
-                        raise FloatingPointError("bad loss detected")
+                    if check_fp_error:
+                        if not torch.isfinite(loss).item():
+                            loss_items = cross_entropy(
+                                logits.reshape(-1, logits.shape[-1]),
+                                targets.reshape(-1),
+                                reduction="none",
+                            ).view_as(targets)
+                            err_info = {
+                                "step": step,
+                                "microbatch": microbatch,
+                                "diagnosis": {
+                                    "loss": diagnose_loss(loss_items),
+                                    "model": diagnose_parameters(model),
+                                },
+                            }
+                            raise FloatingPointError("bad loss detected")
 
                     (loss / grad_accum_steps).backward()
 
@@ -448,12 +452,12 @@ def main():
                 _, stat_avg_perplexity, stat_avg_count = average_loss_and_perplexity(last_stat_step + 1, step)
                 avg_label = f"{stat_avg_perplexity:.2f}" if stat_avg_perplexity is not None else "n/a"
                 print(f"Learning rate: {lr:.6f}, Avg perplexity: {avg_label} ({stat_avg_count} steps)")
-                last_stat_time = now
+                last_stat_time += stat_interval_s
                 last_stat_step = step
 
                 if now - last_save_time >= save_interval_s:
                     save(finished=False, step=step, avg_start_step=last_save_step + 1)
-                    last_save_time = time.monotonic()
+                    last_save_time += save_interval_s
                     last_save_step = step
 
             pbar.update(1)
