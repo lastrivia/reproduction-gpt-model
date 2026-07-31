@@ -20,7 +20,11 @@ def _file_record(file: Path, tokens: int | None = None) -> dict:
     return record
 
 
-def _manifest_matches(manifest: list[dict], files: list[Path]) -> bool:
+def _manifest_matches(
+        manifest: list[dict],
+        files: list[Path],
+        strict_mode: bool = False,
+) -> bool:
     if len(manifest) != len(files):
         return False
     for item, file in zip(manifest, files):
@@ -29,7 +33,7 @@ def _manifest_matches(manifest: list[dict], files: list[Path]) -> bool:
             return False
         if item.get("size") != record["size"]:
             return False
-        if item.get("mtime_ns") != record["mtime_ns"]:
+        if strict_mode and item.get("mtime_ns") != record["mtime_ns"]:
             return False
         if "tokens" not in item:
             return False
@@ -59,7 +63,8 @@ def load_manifest(
         dataset: str,
         rbuf_size: int = 1 << 20,
         print_file_ops: bool = False,
-        data_dir: str | Path = _DATA_DIR
+        data_dir: str | Path = _DATA_DIR,
+        strict_mode: bool = False,
 ) -> list[dict]:
     """Return tokenized chunk metadata for data/{dataset}/tokenized.
 
@@ -68,6 +73,9 @@ def load_manifest(
     - size: compressed file size in bytes
     - mtime_ns: file modification time in nanoseconds
     - tokens: number of uint32 tokens in the decompressed chunk
+
+    By default, cached entries are invalidated only when file names or sizes
+    change. In strict mode, modification times must also match.
     """
     tokenized_dir = Path(data_dir) / dataset / "tokenized"
     files = sorted(tokenized_dir.glob("chunk-*.bin.zst"))
@@ -80,7 +88,7 @@ def load_manifest(
     if manifest_file.exists():
         with open(manifest_file, "r", encoding="utf-8") as f:
             manifest = json.load(f)
-        if not _manifest_matches(manifest, files):
+        if not _manifest_matches(manifest, files, strict_mode=strict_mode):
             build_manifest = True
     else:
         build_manifest = True
