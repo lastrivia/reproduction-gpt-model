@@ -452,12 +452,12 @@ def main():
                 _, stat_avg_perplexity, stat_avg_count = average_loss_and_perplexity(last_stat_step + 1, step)
                 avg_label = f"{stat_avg_perplexity:.2f}" if stat_avg_perplexity is not None else "n/a"
                 print(f"Learning rate: {lr:.6f}, Avg perplexity: {avg_label} ({stat_avg_count} steps)")
-                last_stat_time += stat_interval_s
+                last_stat_time += math.floor((now - last_stat_time) / stat_interval_s + 0.5) * stat_interval_s
                 last_stat_step = step
 
                 if now - last_save_time >= save_interval_s:
                     save(finished=False, step=step, avg_start_step=last_save_step + 1)
-                    last_save_time += save_interval_s
+                    last_save_time += math.floor((now - last_save_time) / save_interval_s + 0.5) * save_interval_s
                     last_save_step = step
 
             pbar.update(1)
