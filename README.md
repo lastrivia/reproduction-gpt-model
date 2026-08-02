@@ -1,47 +1,38 @@
 ## GPT Pretraining Reproduction
 
-A compact PyTorch reproduction project for GPT-style pretraining. The repository implements a desktop-scale language model pipeline covering corpus processing, tokenizer-based binary compression, decoder-only Transformer pretraining, checkpointing, and training curve plotting.
+A compact PyTorch implementation of GPT-style pretraining, covering corpus preparation, training, and evaluation.
 
 ### Overview
-
-This project reproduces a desktop-scale GPT-style pretraining pipeline, with the model internals implemented using PyTorch tensors and modules.
 
 Main features:
 
 - Hand-written decoder-only Transformer components, including RoPE and KV cache support.
-- Vanilla and Hyper-Connections Transformer variants.
+- Vanilla residual, Hyper-Connections (HC), and Manifold-Constrained Hyper-Connections (mHC) architectures.
+- CUDA and Ascend NPU training through a shared accelerator interface.
+- Distributed data parallel (DDP) training.
 - Hugging Face tokenizer-based tokenization.
-- Dataset-local corpus indexing, downloading, chunking, shuffling, and tokenized binary compression scripts.
-- YAML-based model/training presets with derived preset inheritance.
-- Directory checkpoints with metadata, logs, curves, model state, and resumable optimizer/scheduler state.
+- Dataset downloading, chunking, shuffling, and tokenized binary compression scripts.
+- YAML-based backbone model and training presets.
+- Directory checkpoints with metadata, logs, curves, model state, and resumable training state.
 
 ### Model Presets
 
-Presets live in `preset.yaml` and are loaded with `preset.py`. 
+Backbone model and training presets live in `preset.yaml` and are loaded by `preset.py`.
 
-Common presets:
+| Preset | Layers | Hidden | Heads | Params | Seq length | Tokens/step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `small` | 12 | 768 | 12 | 152M | 2,048 | 32,768 |
+| `medium` | 24 | 1,024 | 16 | 454M | 2,048 | 65,536 |
 
-| Preset | Layers | Hidden | Heads | Norm | Seq len | Batch size | Tokens/step | VRAM (Vanilla) |
-| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | 
-| `smallest-classic` | 6 | 512 | 8 | LayerNorm | 512 | 16 | 8,192 | 9 GiB |
-| `small-classic` | 12 | 768 | 12 | LayerNorm | 512 | 8 | 4,096 | 8 GiB |
-| `medium-classic` | 24 | 1024 | 16 | LayerNorm | 512 | 4 | 2,048 | 11 GiB |
-| `small` | 12 | 768 | 12 | RMSNorm | 2048 | 2 | 32,768 | 9 GiB |
-| `small-server` | 12 | 768 | 12 | RMSNorm | 2048 | 4 | 32,768 | |
-| `medium` | 24 | 1024 | 16 | RMSNorm | 2048 | 1 | 65,536 | 13 GiB |
-| `medium-server` | 24 | 1024 | 16 | RMSNorm | 2048 | 2 | 65,536 | |
+Supported residual-stream architectures include:
 
-`residual_arch` selects the residual-stream architecture:
-
-- `vanilla`: standard decoder-only Transformer residual stream, following Transformer-style residual blocks.
+- `vanilla`: standard decoder-only Transformer residual stream.
 - `hc`: Hyper-Connections, which expand the residual stream into multiple streams and learn cross-depth feature routing ([Zhu et al., 2024](https://arxiv.org/abs/2409.19606)).
-- `mhc`: Manifold-Constrained Hyper-Connections constrain the HC residual mixing space to improve identity mapping and efficiency ([Xie et al., 2025](https://arxiv.org/abs/2512.24880)).
+- `mhc`: Manifold-Constrained Hyper-Connections, which constrain the HC residual mixing space to improve identity mapping and efficiency ([Xie et al., 2025](https://arxiv.org/abs/2512.24880)).
 
-Training uses AdamW with warmup, cosine decay, and a final constant learning-rate stage. Perplexity is logged every optimizer step, while console stats and checkpoints report average perplexity over the elapsed time interval since the previous stat/save event.
+Training uses AdamW with warmup and cosine decay scheduling.
 
-### Usage
-
-#### Data Preparation
+### Data Preparation
 
 For each dataset under `data/*/`, run the dataset-local preparation scripts in order:
 
@@ -62,38 +53,66 @@ python run_tokenizer.py
 
 The current training entry point uses the prepared `fineweb-edu` dataset.
 
-#### Pretraining
+### Training
 
-Start a new vanilla run by choosing a save directory and residual architecture:
-
-```bash
-python train.py -d results/vanilla -a vanilla
-```
-
-Start an HC run:
+Start a new run:
 
 ```bash
-python train.py -d results/hc -p small -a hc --dynamic --tanh
+python train.py <save_dir> -a <vanilla|hc|mhc> -p <small|medium> -b <micro_batch_size> [--cuda(default)|--cann]
 ```
 
-Resume an existing checkpoint with the save directory:
+For example:
 
 ```bash
-python train.py -d results/hc
+python train.py results/vanilla -a vanilla -p small -b 1
 ```
 
-When `latest/` exists under the save directory, training arguments are automatically resumed from checkpoint metadata. CLI arguments are treated as optional consistency checks: explicitly provided arguments must match the checkpoint or training raises an error.
+When `latest/` exists under `save_dir`, model arguments can be restored from its checkpoint metadata. Resume a run by passing the same save directory:
 
-Supported training arguments:
+```bash
+python train.py results/vanilla -b 1
+```
 
-```text
--d, --save-dir          Required checkpoint directory
--p, --model-preset      Preset name from preset.yaml
--a, --residual-arch     vanilla | hc; required only for a new run
---compatible            Use legacy sum-reduction loss scaling
---expansion-rate        HC-only expansion rate
---dynamic               HC-only dynamic routing flag
---tanh                  HC-only tanh flag
+**Training arguments**
+
+- `save_dir`: required on every run. Checkpoints are saved under this directory. Passing a directory containing `latest/` checkpoint resumes that run.
+
+- **Model architecture arguments** must be provided when starting a new run. They are restored from checkpoint metadata when resuming.
+
+  - `-a`, `--residual-arch <str>`: selects a residual architecture from `vanilla`, `hc`, or `mhc`.
+  - `-p`, `--model-preset <str>`: selects a model preset in `preset.yaml`, such as `small` or `medium`.
+  - HC-specific arguments:
+    - `--expansion-rate <int>`: the residual-stream expansion rate.
+    - `--dynamic`: enables dynamic HC.
+    - `--tanh`: applies `tanh` in dynamic HC.
+  - mHC-specific arguments:
+    - `--expansion-rate <int>`: the residual-stream expansion rate.
+    - `--sinkhorn-iters <int>`: the number of Sinkhorn-Knopp iterations.
+
+- **Training device arguments** must be provided on every run according to the available accelerator type and VRAM capacity. They do not change the intended mathematical training behavior; actual results may still vary with accelerator implementations, numerical precision, and operation ordering.
+
+  - `-b`, `--micro-batch-size <int>`: sequences per micro batch. Should be chosen to fit device VRAM.
+  - `--cuda` (alias: `--nvidia`): use CUDA. Requires an NVIDIA GPU.
+  - `--cann` (aliases: `--ascend`, `--huawei`): use CANN. Requires a Huawei Ascend NPU.
+
+  If neither `--cuda` nor `--cann` is specified, `--cuda` is used by default. Specifying both results in an error.
+
+  
+
+**Distributed Training**
+
+Start a 4-card CUDA run with `torchrun`:
+
+```bash
+torchrun --standalone --nproc-per-node=4 \
+  train.py results/vanilla-ddp --cuda -a vanilla -p small -b 1
+```
+
+For Ascend NPU, select the CANN accelerator:
+
+```bash
+torchrun --standalone --nproc-per-node=4 \
+  train.py results/vanilla-ddp --cann -a vanilla -p small -b 1
 ```
 
 ### Checkpoints
@@ -110,34 +129,51 @@ bak_1/
 
 `latest/` is the active resumable checkpoint. `finished/` marks a completed run and is treated as finished by the training entry point. Older checkpoints are rotated into `bak_*`.
 
+### Evaluation
+
+`eval.py` evaluates a saved checkpoint and prints perplexity over a selected range of prepared batches:
+
+```bash
+python eval.py results/vanilla \
+  --seq-len 2048 --batch-size 2 \
+  --start-batch-idx 0 --n-batches 100
+```
+
+The checkpoint argument may point to a `model.pt` file, a checkpoint directory, or a training save directory.
+
+Evaluation support for CANN is TODO.
+
 ### Source Structure
 
 ```text
 .
-|-- checkpoint.py          # Directory checkpoint save/load/init helpers
-|-- dataset.py             # Single-dataset token batch IterableDataset
-|-- dict_tools.py          # Recursive checked dict override/conflict helpers
-|-- plot.py                # Training curve plotting utility
-|-- preset.py              # Load and expand preset.yaml entries
-|-- preset.yaml            # Model/training preset definitions
-|-- scheduler.py           # Warmup/cosine/constant scheduler helper
-|-- train.py               # Modern pretraining entry point
-|-- data/                  # Data download, cleaning, chunking, and statistics scripts
-|   |-- manifest.py        # Tokenized chunk manifest generation
-|   `-- */                 # Dataset-specific index/download/chunk/shuffle scripts
-|-- tokenizer/             # Tokenizer and tokenization tools
-|   |-- tokenizer/         # Local saved Hugging Face tokenizer
-|   |-- run_tokenizer.py   # Convert shuffled parquet chunks into token chunks
-|   `-- bin_preview.py     # Inspect compressed token chunks
-|-- transformer/           # Transformer model implementation
-|   |-- transformer.py     # Vanilla DecoderBlock and Transformer modules
-|   |-- hc_transformer.py  # HC-style Transformer variant
-|   |-- attention.py       # Causal attention and KV cache attention
-|   |-- rope.py            # RoPE positional encoding
-|   |-- swiglu.py          # SwiGLU activation module
-|   `-- kv_cache.py        # KV cache implementation for inference
-|-- utils/                 # Utility scripts, including checkpoint/model conversion tools
-`-- results/               # Checkpoints and training outputs
+|-- checkpoint.py                   # Checkpoint save/load helpers
+|-- dataset.py                      # Dataset loader
+|-- eval.py                         # Evaluation entry point
+|-- preset.py                       # Preset loader
+|-- preset.yaml                     # Model and training presets
+|-- train.py                        # Training entry point
+|-- accelerator/
+|   |-- cuda.py                     # CUDA device and NCCL configuration
+|   `-- cann.py                     # Ascend NPU device and HCCL configuration
+|-- data/
+|   |-- manifest.py                 # Chunk manifest generation
+|   `-- */                          # Dataset preparation scripts and artifacts
+|-- tokenizer/
+|   |-- tokenizer/                  # Local saved Hugging Face tokenizer
+|   `-- run_tokenizer.py            # Convert shuffled parquet chunks to token chunks
+|-- transformer/
+|   |-- transformer.py              # Vanilla Transformer
+|   |-- hc_transformer.py           # Hyper-Connections Transformer
+|   |-- mhc_transformer.py          # Manifold-Constrained HC Transformer
+|   |-- attention.py                # Causal and KV-cache attention
+|   |-- rope.py                     # Rotary position embeddings
+|   |-- swiglu.py                   # SwiGLU activation
+|   `-- kv_cache.py                 # Inference KV cache
+`-- utils/
+    |-- dict_tools.py               # Set operation helpers for Python dict
+    |-- distributed_context.py      # Rank context for torchrun
+    |-- fp_diagnosis.py             # Numerical diagnostics
+    |-- plot.py                     # Training curve plotting
+    `-- warmup_cosine_scheduler.py  # Scheduler
 ```
-
-Evaluation and interactive inference are still TODO.
