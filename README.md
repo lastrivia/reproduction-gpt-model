@@ -1,6 +1,6 @@
-## GPT Pretraining Reproduction
+## Transformer LM Pretraining Pipeline
 
-A compact PyTorch implementation of GPT-style pretraining, covering corpus preparation, training, and evaluation.
+A compact PyTorch implementation of Transformer language model pretraining, covering corpus preparation, training, and evaluation.
 
 ### Overview
 
