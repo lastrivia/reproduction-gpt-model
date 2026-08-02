@@ -16,9 +16,8 @@ class Accelerator:
 
         self.device_index = device_index
         self.device = torch.device("npu", device_index)
-
-    def name(self) -> str:
-        return str(self.device)
+        self.name = f"npu:{device_index}"
+        self.distributed_backend = "hccl"
 
     def manual_seed(self, seed: int) -> None:
         torch_npu.npu.manual_seed(seed)
@@ -36,5 +35,8 @@ class Accelerator:
             enabled=enabled,
         )
 
-    def synchronize(self) -> None:
+    def sync(self) -> None:
         torch_npu.npu.synchronize(self.device)
+
+    def set_device(self) -> None:
+        torch_npu.npu.set_device(self.device_index)

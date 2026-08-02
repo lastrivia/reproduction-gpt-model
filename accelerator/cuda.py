@@ -15,9 +15,8 @@ class Accelerator:
 
         self.device_index = device_index
         self.device = torch.device("cuda", device_index)
-
-    def name(self) -> str:
-        return str(self.device)
+        self.name = f"cuda:{device_index}"
+        self.distributed_backend = "nccl"
 
     def manual_seed(self, seed: int) -> None:
         torch.cuda.manual_seed(seed)
@@ -35,5 +34,8 @@ class Accelerator:
             enabled=enabled,
         )
 
-    def synchronize(self) -> None:
+    def sync(self) -> None:
         torch.cuda.synchronize(self.device)
+
+    def set_device(self) -> None:
+        torch.cuda.set_device(self.device_index)

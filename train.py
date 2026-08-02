@@ -1,4 +1,5 @@
 import argparse
+from contextlib import nullcontext
 import json
 import math
 import random
@@ -7,7 +8,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as torch_dist
 from torch.nn.functional import cross_entropy
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW, Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -15,10 +18,10 @@ from transformers import AutoTokenizer
 
 from checkpoint import CheckpointState, init_checkpoint, load_checkpoint_meta, save_checkpoint
 from dataset import TokenizedBatchDataset
-from utils.fp_diagnosis import diagnose_loss, diagnose_parameters
 from utils.dict_tools import check_conflict, override_dict
+from utils.warmup_cosine_scheduler import build_warmup_cosine_scheduler
+from utils.distributed_context import DistributedContext
 from preset import load_preset
-from scheduler import build_warmup_cosine_scheduler
 from transformer.hc_transformer import HCTransformer
 from transformer.mhc_transformer import MHCTransformer
 from transformer.transformer import Transformer
@@ -60,14 +63,13 @@ default_args = {
 }
 
 
-def parse_args() -> tuple[Path, int, str, int | None, dict]:
+def parse_args() -> tuple[Path, str, int | None, dict]:
     parser = argparse.ArgumentParser(
         description="Train a GPT-style model.",
         argument_default=argparse.SUPPRESS,
     )
 
     parser.add_argument("save_dir", type=Path)
-    parser.add_argument("-i", "--device-index", type=int, default=0)
     parser.add_argument("-b", "--micro-batch-size", type=int)
 
     accelerator_group = parser.add_mutually_exclusive_group()
@@ -79,11 +81,12 @@ def parse_args() -> tuple[Path, int, str, int | None, dict]:
         const="cuda",
     )
     accelerator_group.add_argument(
+        "--cann",
         "--ascend",
         "--huawei",
         dest="accelerator",
         action="store_const",
-        const="ascend",
+        const="cann",
     )
     parser.set_defaults(accelerator="cuda")
 
@@ -97,7 +100,6 @@ def parse_args() -> tuple[Path, int, str, int | None, dict]:
 
     raw_args = parser.parse_args()
     save_dir = raw_args.save_dir
-    device_index = raw_args.device_index
     accelerator_name = raw_args.accelerator
     micro_batch_size = getattr(raw_args, "micro_batch_size", None)
     raw_args = vars(raw_args)
@@ -115,7 +117,7 @@ def parse_args() -> tuple[Path, int, str, int | None, dict]:
     if arch_params:
         args["arch_params"] = arch_params
 
-    return save_dir, device_index, accelerator_name, micro_batch_size, args
+    return save_dir, accelerator_name, micro_batch_size, args
 
 
 def set_seed(seed: int, accelerator):
@@ -130,17 +132,24 @@ def main():
     # parse args
     # ================================
 
-    save_dir, device_index, accelerator_name, cli_micro_batch_size, cli_args = parse_args()
+    save_dir, accelerator_name, cli_micro_batch_size, cli_args = parse_args()
 
-    if accelerator_name == "ascend":
-        from accelerator.ascend import Accelerator
-    else:
+    if accelerator_name == "cuda":
         from accelerator.cuda import Accelerator
+    elif accelerator_name == "cann":
+        from accelerator.cann import Accelerator
+    else:
+        raise NotImplementedError(f"unknown accelerator {accelerator_name}")
 
-    accelerator = Accelerator(device_index)
+    dctx = DistributedContext.from_env()
+
+    accelerator = Accelerator(dctx.local_rank)
+    accelerator.set_device()
+
     set_seed(global_seed, accelerator)
-    device = accelerator.name()
-    print("Device:", device)
+    device = accelerator.device
+    if dctx.is_main:
+        print("Device:", accelerator.name)
 
     checkpoint_meta = load_checkpoint_meta(save_dir)
     meta = checkpoint_meta.meta
@@ -164,8 +173,9 @@ def main():
         check_conflict(cli_args, checkpoint_args)
         run_args = checkpoint_args
 
-    print("Run args:")
-    print(json.dumps(run_args, indent=2))
+    if dctx.is_main:
+        print("Run args:")
+        print(json.dumps(run_args, indent=2))
 
     # ================================
     # load training preset
@@ -196,10 +206,15 @@ def main():
             "tokens_per_step must be divisible by micro_batch_size * seq_len: "
             f"{tokens_per_step} % ({micro_batch_size} * {seq_len}) != 0"
         )
-    grad_accum_steps = tokens_per_step // (micro_batch_size * seq_len)
+    micro_batches_per_step = tokens_per_step // (micro_batch_size * seq_len)
+    if micro_batches_per_step < dctx.world_size:
+        raise ValueError(
+            "micro batches per step must be at least world size: "
+            f"{micro_batches_per_step} < {dctx.world_size}"
+        )
     training_tokens = int(vanilla_params * chinchilla_coeff)
-    n_steps = training_tokens // tokens_per_step
-    actual_training_tokens = n_steps * tokens_per_step
+    total_steps = training_tokens // tokens_per_step
+    actual_training_tokens = total_steps * tokens_per_step
 
     # ================================
     # prepare tokenizer
@@ -215,7 +230,8 @@ def main():
         local_files_only=True
     )
     vocab_size = len(tokenizer)
-    print("Vocab size:", vocab_size)
+    if dctx.is_main:
+        print("Vocab size:", vocab_size)
 
     # ================================
     # initialize model
@@ -246,11 +262,12 @@ def main():
         raise NotImplementedError(f"unknown residual_arch: {run_args['residual_arch']}")
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Params: {total_params:,}")
-    print(f"Training steps: {n_steps:,}")
-    print(f"Training tokens: {training_tokens:,} (target), {actual_training_tokens:,} (actual)")
-    print(f"Micro batch size: {micro_batch_size}")
-    print(f"Gradient accumulation steps: {grad_accum_steps}")
+    if dctx.is_main:
+        print(f"Params: {total_params:,}")
+        print(f"Training steps: {total_steps:,}")
+        print(f"Training tokens: {training_tokens:,} (target), {actual_training_tokens:,} (actual)")
+        print(f"Micro batch size: {micro_batch_size}")
+        print(f"Micro batches per step: {micro_batches_per_step}")
 
     # ================================
     # initialize training context
@@ -263,8 +280,8 @@ def main():
     def build_scheduler(optimizer):
         return build_warmup_cosine_scheduler(
             optimizer,
-            warmup_steps=int(n_steps * warmup_ratio),
-            cosine_steps=int(n_steps * cosine_ratio),
+            warmup_steps=int(total_steps * warmup_ratio),
+            cosine_steps=int(total_steps * cosine_ratio),
             max_lr=max_lr,
             min_lr=min_lr,
         )
@@ -277,7 +294,8 @@ def main():
         build_scheduler=build_scheduler,
     )
     if state.finished:
-        print(f"Checkpoint already finished: {state.checkpoint_dir}")
+        if dctx.is_main:
+            print(f"Checkpoint already finished: {state.checkpoint_dir}")
         return
 
     optimizer = state.optimizer
@@ -286,16 +304,17 @@ def main():
         raise RuntimeError("optimizer and scheduler must be initialized")
 
     start_step = state.meta["step"] + 1 if state.resumed else 0
-    if start_step >= n_steps:
-        print("Training already reached target steps.")
+    if start_step >= total_steps:
+        if dctx.is_main:
+            print("Training already reached target steps.")
         return
 
     # ================================
     # initialize data loader
     # ================================
 
-    start_batch_idx = start_step * grad_accum_steps
-    max_batches = (n_steps - start_step) * grad_accum_steps
+    start_batch_idx = start_step * micro_batches_per_step
+    max_batches = (total_steps - start_step) * micro_batches_per_step
 
     loader = DataLoader(
         TokenizedBatchDataset(
@@ -347,7 +366,7 @@ def main():
             "weight_decay": weight_decay,
             "grad_clip_norm": grad_clip_norm,
             "dataset": dataset_name,
-            "n_steps": n_steps,
+            "n_steps": total_steps,
             "training_tokens": actual_training_tokens,
             "stat_interval_s": stat_interval_s,
             "save_interval_s": save_interval_s,
@@ -373,112 +392,147 @@ def main():
         print(f"{checkpoint_label} saved; Avg perplexity: {avg_label} ({avg_count} steps)")
 
     model.train()
-    train_model = torch.compile(model) if use_compile else model
+    train_model = model
+
+    if use_compile:
+        train_model = torch.compile(train_model)
+
+    if dctx.enabled:
+        torch_dist.init_process_group(backend=accelerator.distributed_backend)
+        train_model = DistributedDataParallel(
+            train_model,
+            device_ids=[dctx.local_rank],
+            output_device=dctx.local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+
     optimizer.zero_grad()
 
     log_rows = state.log_rows
 
-    pbar = tqdm(
-        total=n_steps,
-        initial=start_step,
-        mininterval=0,
-        ncols=80,
-    )
     data_iter = iter(loader)
 
-    last_stat_time = time.monotonic()
-    last_save_time = last_stat_time
-    last_stat_step = start_step - 1
-    last_save_step = start_step - 1
+    if dctx.is_main:
+        pbar = tqdm(
+            total=total_steps,
+            initial=start_step,
+            mininterval=0,
+            ncols=80,
+        )
+        last_stat_time = time.monotonic()
+        last_save_time = last_stat_time
+        last_stat_step = start_step - 1
+        last_save_step = start_step - 1
 
-    err_info = None
     try:
-        for step in range(start_step, n_steps):
-            step_loss = 0.0
+        for step in range(start_step, total_steps):
 
-            for microbatch in range(grad_accum_steps):
-                batch = next(data_iter).to(device)
+            local_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+
+            for microbatch in range(micro_batches_per_step):
+                batch = next(data_iter)
+                if microbatch % dctx.world_size != dctx.rank:
+                    continue
+                batch = batch.to(device)
                 inputs = batch[:, :-1]
                 targets = batch[:, 1:]
 
-                with accelerator.autocast(dtype=torch.bfloat16):
-                    logits = train_model(inputs)
-                    loss = cross_entropy(
-                        logits.reshape(-1, logits.shape[-1]),
-                        targets.reshape(-1),
-                        reduction="mean",
+                if dctx.enabled:
+                    if microbatch + dctx.world_size < micro_batches_per_step:
+                        sync_context = train_model.no_sync()
+                    else:
+                        sync_context = nullcontext()  # grad all-reduce
+                else:
+                    sync_context = nullcontext()
+
+                with sync_context:
+                    with accelerator.autocast(dtype=torch.bfloat16):
+                        logits = train_model(inputs)
+                        loss = cross_entropy(
+                            logits.reshape(-1, logits.shape[-1]),
+                            targets.reshape(-1),
+                            reduction="mean",
+                        )
+
+                    loss_avg_scale = dctx.world_size / micro_batches_per_step
+                    (loss * loss_avg_scale).backward()
+
+                local_loss_sum += loss.detach().float()
+
+            if dctx.enabled:
+                torch_dist.reduce(local_loss_sum, dst=0, op=torch_dist.ReduceOp.SUM)
+            if dctx.is_main:
+                step_loss = (local_loss_sum / micro_batches_per_step).item()
+
+            if check_fp_error:
+                fp_error = not math.isfinite(step_loss) if dctx.is_main else False
+                if dctx.enabled:  # broadcast error
+                    fp_error_tensor = torch.tensor(
+                        int(fp_error),
+                        device=device,
+                        dtype=torch.int32,
                     )
-
-                    if check_fp_error:
-                        if not torch.isfinite(loss).item():
-                            loss_items = cross_entropy(
-                                logits.reshape(-1, logits.shape[-1]),
-                                targets.reshape(-1),
-                                reduction="none",
-                            ).view_as(targets)
-                            err_info = {
-                                "step": step,
-                                "microbatch": microbatch,
-                                "diagnosis": {
-                                    "loss": diagnose_loss(loss_items),
-                                    "model": diagnose_parameters(model),
-                                },
-                            }
-                            raise FloatingPointError("bad loss detected")
-
-                    (loss / grad_accum_steps).backward()
-
-                micro_loss = loss.item()
-                step_loss += micro_loss / grad_accum_steps
+                    torch_dist.broadcast(fp_error_tensor, src=0)
+                    fp_error = bool(fp_error_tensor.item())
+                if fp_error:
+                    optimizer.zero_grad()
+                    if dctx.is_main:
+                        raise FloatingPointError("bad step loss detected")
+                    return
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-            ppl = math.exp(step_loss)
-            lr = optimizer.param_groups[0]["lr"]
+            if dctx.is_main:
+                ppl = math.exp(step_loss)
+                lr = optimizer.param_groups[0]["lr"]
 
-            log_rows.append({
-                "step": step,
-                "loss": step_loss,
-                "ppl": ppl,
-                "lr": lr,
-            })
+                log_rows.append({
+                    "step": step,
+                    "loss": step_loss,
+                    "ppl": ppl,
+                    "lr": lr,
+                })
 
-            now = time.monotonic()
-            if now - last_stat_time >= stat_interval_s:
-                _, stat_avg_perplexity, stat_avg_count = average_loss_and_perplexity(last_stat_step + 1, step)
-                avg_label = f"{stat_avg_perplexity:.2f}" if stat_avg_perplexity is not None else "n/a"
-                print(f"Learning rate: {lr:.6f}, Avg perplexity: {avg_label} ({stat_avg_count} steps)")
-                last_stat_time += math.floor((now - last_stat_time) / stat_interval_s + 0.5) * stat_interval_s
-                last_stat_step = step
+                now = time.monotonic()
+                if now - last_stat_time >= stat_interval_s:
+                    _, stat_avg_perplexity, stat_avg_count = average_loss_and_perplexity(last_stat_step + 1, step)
+                    avg_label = f"{stat_avg_perplexity:.2f}" if stat_avg_perplexity is not None else "n/a"
+                    print(f"Learning rate: {lr:.6f}, Avg perplexity: {avg_label} ({stat_avg_count} steps)")
+                    last_stat_time += math.floor((now - last_stat_time) / stat_interval_s + 0.5) * stat_interval_s
+                    last_stat_step = step
 
-                if now - last_save_time >= save_interval_s:
-                    save(finished=False, step=step, avg_start_step=last_save_step + 1)
-                    last_save_time += math.floor((now - last_save_time) / save_interval_s + 0.5) * save_interval_s
-                    last_save_step = step
+                    if now - last_save_time >= save_interval_s:
+                        save(finished=False, step=step, avg_start_step=last_save_step + 1)
+                        last_save_time += math.floor((now - last_save_time) / save_interval_s + 0.5) * save_interval_s
+                        last_save_step = step
 
-            pbar.update(1)
+                pbar.update(1)
 
-        pbar.close()
-
-        save(finished=True, step=n_steps - 1, avg_start_step=last_save_step + 1)
+        if dctx.is_main:
+            pbar.close()
+            save(finished=True, step=total_steps - 1, avg_start_step=last_save_step + 1)
 
     except FloatingPointError as exc:
         optimizer.zero_grad()
-        if err_info is None:
+        if dctx.is_main:
             err_info = {
                 "exception": {
                     "type": type(exc).__name__,
                     "message": str(exc),
                 },
             }
-        error_step = log_rows[-1]["step"] if log_rows else start_step - 1
-        save(finished=False, step=error_step, avg_start_step=last_save_step + 1, error=True, diagnosis=err_info)
-        pbar.close()
+            error_step = log_rows[-1]["step"] if log_rows else start_step - 1
+            save(finished=False, step=error_step, avg_start_step=last_save_step + 1, error=True, diagnosis=err_info)
+            pbar.close()
         raise
+
+    finally:
+        if dctx.enabled:
+            torch_dist.destroy_process_group()
 
 
 if __name__ == "__main__":
